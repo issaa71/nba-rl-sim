@@ -572,7 +572,58 @@ button {
 
 .scrub input[type="range"] {
   flex: 1;
+  width: 100%;
   accent-color: var(--accent);
+  position: relative;
+  z-index: 1;
+}
+
+/* continuous scrubber: range input over a thin track of recorded-frame markers */
+.scrub__track-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.scrub__markers {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0;
+  pointer-events: none;
+}
+
+.scrub__marker {
+  position: absolute;
+  top: 0;
+  transform: translate(-50%, -50%);
+  width: 7px;
+  height: 7px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--border);
+  pointer-events: auto;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.scrub__marker:hover {
+  background: var(--accent-dim);
+}
+
+.scrub__marker.is-decision {
+  width: 9px;
+  height: 9px;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.scrub__marker.is-current {
+  background: var(--foreground);
+  transform: translate(-50%, -50%) scale(1.15);
 }
 
 .scrub__pos {
@@ -581,6 +632,15 @@ button {
   color: var(--faint);
   min-width: 52px;
   text-align: right;
+}
+
+/* honesty caption near the live recommendation chip */
+.live-caption {
+  margin: 10px 0 0;
+  font-size: 10.5px;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  color: var(--faint);
 }
 
 .iconbtn {

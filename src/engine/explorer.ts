@@ -13,6 +13,7 @@ import {
   BASKET_Y,
   buildFeatures,
   deriveContext,
+  distanceToBasket,
   type ContextInput,
   type RawState,
 } from "./features";
@@ -171,4 +172,157 @@ export function playerChoice(
   playerAction: number,
 ): QResult {
   return { q: duelingQ, best: playerAction };
+}
+
+// ---------------------------------------------------------------------------
+// Live (continuous-playback) interpolation glue.
+//
+// Recorded frames are ~2 Hz samples. For smooth ~30 fps playback we linearly
+// interpolate positions, velocities and the shot clock between two adjacent
+// recorded frames, then run the FULL live path on the interpolated state:
+//   interpolate -> re-sort to canonical order -> re-lookup zone FG%
+//   -> deriveContext -> buildFeatures -> forward.
+//
+// Re-sorting + zone-FG re-lookup are MANDATORY before deriveContext (see
+// features.ts::deriveContext — it consumes entities in canonical sorted order
+// and treats teammate_zone_fg as a per-player table lookup, not geometry).
+//
+// At integer playback time `t` (i.e. landing exactly on a recorded frame) the
+// caller should use the parity-exact recorded path instead (frameToRawState),
+// so stored vs live Q-values never drift at sample points.
+// ---------------------------------------------------------------------------
+
+/** A position/velocity sample shared by both endpoints of an interpolation. */
+interface PV {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+}
+
+/** One interpolated offensive/defensive entity, carrying identity for re-sort. */
+export interface LiveEntity extends PV {
+  /** stable index into the recorded teammate/defender array (for FG lookups). */
+  srcIndex: number;
+}
+
+/** A fully interpolated frame snapshot, pre-sort. */
+export interface LiveFrame {
+  ballHandler: PV;
+  teammates: LiveEntity[];
+  defenders: LiveEntity[];
+  shotClock: number;
+}
+
+const lerp = (a: number, b: number, f: number): number => a + (b - a) * f;
+
+function lerpPV(a: PV, b: PV, f: number): PV {
+  return {
+    x: lerp(a.x, b.x, f),
+    y: lerp(a.y, b.y, f),
+    vx: lerp(a.vx, b.vx, f),
+    vy: lerp(a.vy, b.vy, f),
+  };
+}
+
+/**
+ * Linearly interpolate every entity (and the shot clock) between two adjacent
+ * recorded frames. `f` is the fractional position in [0, 1] from `a` to `b`.
+ *
+ * Teammates/defenders are matched by array index — both endpoints share the
+ * recorded canonical ordering, so index i in frame `a` and frame `b` is the
+ * same logical player for the span of one 2 Hz interval. (Identity for FG
+ * lookups is taken from frame `a` via `srcIndex`.)
+ */
+export function interpolateFrame(a: Frame, b: Frame, f: number): LiveFrame {
+  return {
+    ballHandler: lerpPV(a.ball_handler, b.ball_handler, f),
+    teammates: a.teammates.map((t, i) => ({
+      ...lerpPV(t, b.teammates[i] ?? t, f),
+      srcIndex: i,
+    })),
+    defenders: a.defenders.map((d, i) => ({
+      ...lerpPV(d, b.defenders[i] ?? d, f),
+      srcIndex: i,
+    })),
+    shotClock: lerp(a.shot_clock, b.shot_clock, f),
+  };
+}
+
+/**
+ * Build a parity-faithful `RawState` from an interpolated `LiveFrame`.
+ *
+ * Re-sorts entities to canonical order (defenders closest-first to the BH,
+ * teammates dist-to-BH ascending — matching environment.py), re-looks-up each
+ * teammate's zone FG% at its interpolated spot, recomputes the BH zone FG% +
+ * distance-to-basket, then rebuilds context via the engine's `deriveContext`.
+ *
+ * @param live        interpolated snapshot
+ * @param bhZoneFgFor BH compact-id zone-FG lookup
+ * @param tmZoneFgFor per-recorded-teammate zone-FG lookups, indexed by srcIndex
+ */
+export function liveFrameToRawState(
+  live: LiveFrame,
+  bhZoneFgFor: (x: number, y: number) => number,
+  tmZoneFgFor: ((x: number, y: number) => number)[],
+): RawState {
+  const bh = live.ballHandler;
+
+  // Re-sort defenders closest-first to the (interpolated) ball-handler.
+  const defenders = [...live.defenders].sort(
+    (p, q) => distSq(p, bh) - distSq(q, bh),
+  );
+  // Re-sort teammates by distance-to-BH ascending (teammate slot i == pass i).
+  const teammates = [...live.teammates].sort(
+    (p, q) => distSq(p, bh) - distSq(q, bh),
+  );
+
+  // Re-lookup zone FG% per teammate at its interpolated position, keyed by the
+  // teammate's recorded identity (srcIndex) — NOT its post-sort slot.
+  const tmWithFg = teammates.map((t) => ({
+    x: t.x,
+    y: t.y,
+    zone_fg_pct: (tmZoneFgFor[t.srcIndex] ?? (() => 0))(t.x, t.y),
+  }));
+
+  const ctx = deriveContext(
+    { x: bh.x, y: bh.y },
+    tmWithFg,
+    defenders.map((d) => ({ x: d.x, y: d.y })),
+  );
+
+  return {
+    ball_handler: {
+      compact_id: 0,
+      x: bh.x,
+      y: bh.y,
+      vx: bh.vx,
+      vy: bh.vy,
+      distance_to_basket: distanceToBasket(bh.x, bh.y),
+      zone_fg_pct: bhZoneFgFor(bh.x, bh.y),
+    },
+    teammates: teammates.map((t, i) => ({
+      slot: i + 1,
+      compact_id: 0,
+      x: t.x,
+      y: t.y,
+      vx: t.vx,
+      vy: t.vy,
+    })),
+    defenders: defenders.map((d, i) => ({
+      slot: i + 1,
+      x: d.x,
+      y: d.y,
+      vx: d.vx,
+      vy: d.vy,
+    })),
+    shot_clock: live.shotClock,
+    context: ctx,
+  };
+}
+
+function distSq(p: { x: number; y: number }, q: { x: number; y: number }): number {
+  const dx = p.x - q.x;
+  const dy = p.y - q.y;
+  return dx * dx + dy * dy;
 }

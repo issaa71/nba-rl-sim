@@ -10,6 +10,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   frameToRawState,
+  interpolateFrame,
+  liveFrameToRawState,
   runState,
   whatIfToRawState,
   type WhatIfState,
@@ -98,6 +100,66 @@ describe("explorer engine glue", () => {
       expect(q.every(Number.isFinite)).toBe(true);
       expect(best).toBeGreaterThanOrEqual(0);
       expect(best).toBeLessThan(5);
+    }
+  });
+});
+
+describe("live interpolation glue (continuous playback)", () => {
+  // A possession that has at least two recorded frames to interpolate across.
+  const p = poss.possessions.find((q) => q.frames.length >= 2)!;
+
+  const lookupsFor = (frameIdx: number) => {
+    const f = p.frames[frameIdx];
+    return {
+      bhFg: makeZoneFgLookup(zoneFg, f.ball_handler.compact_id),
+      tmFg: f.teammates.map((t) => makeZoneFgLookup(zoneFg, t.compact_id)),
+    };
+  };
+
+  it("at f=0 the live path tracks the recorded frame (positions + finite Q)", () => {
+    const lo = 0;
+    const a = p.frames[lo];
+    const b = p.frames[lo + 1];
+    const live = interpolateFrame(a, b, 0);
+    // f=0 must reproduce frame `a`'s ball-handler position exactly.
+    expect(live.ballHandler.x).toBeCloseTo(a.ball_handler.x, 10);
+    expect(live.ballHandler.y).toBeCloseTo(a.ball_handler.y, 10);
+    expect(live.shotClock).toBeCloseTo(a.shot_clock, 10);
+
+    const { bhFg, tmFg } = lookupsFor(lo);
+    const state = liveFrameToRawState(live, bhFg, tmFg);
+    const { q, best } = runState(dueling, state, p.entity_ids_network_order);
+    expect(q.every(Number.isFinite)).toBe(true);
+    expect(best).toBeGreaterThanOrEqual(0);
+    expect(best).toBeLessThan(5);
+  });
+
+  it("midpoint interpolation sits between the two endpoints", () => {
+    const a = p.frames[0];
+    const b = p.frames[1];
+    const mid = interpolateFrame(a, b, 0.5);
+    const lo = Math.min(a.ball_handler.x, b.ball_handler.x);
+    const hi = Math.max(a.ball_handler.x, b.ball_handler.x);
+    expect(mid.ballHandler.x).toBeGreaterThanOrEqual(lo - 1e-9);
+    expect(mid.ballHandler.x).toBeLessThanOrEqual(hi + 1e-9);
+    expect(mid.ballHandler.x).toBeCloseTo(
+      (a.ball_handler.x + b.ball_handler.x) / 2,
+      10,
+    );
+  });
+
+  it("yields 5 finite Q-values across the whole interpolated span (both models)", () => {
+    const { bhFg, tmFg } = lookupsFor(0);
+    for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+      const live = interpolateFrame(p.frames[0], p.frames[1], f);
+      const state = liveFrameToRawState(live, bhFg, tmFg);
+      for (const net of [dueling, dqn]) {
+        const { q, best } = runState(net, state, p.entity_ids_network_order);
+        expect(q.length).toBe(5);
+        expect(q.every(Number.isFinite)).toBe(true);
+        expect(best).toBeGreaterThanOrEqual(0);
+        expect(best).toBeLessThan(5);
+      }
     }
   });
 });

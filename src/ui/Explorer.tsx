@@ -1,11 +1,23 @@
 // Explorer view — the heart. Court replay + scrubber + live Q-values +
 // outcome reveal + what-if dragging. Everything is computed in-browser via the
 // (parity-tested) engine.
+//
+// Two layers, additive:
+//   1. Decision-point experience (unchanged): clickable/steppable decision
+//      frames with EXACT recorded values, outcome reveal, what-if drag.
+//   2. Live mode (added on top): pressing PLAY animates the dots at ~30 fps by
+//      linearly interpolating between the ~2 Hz recorded frames, with the agent
+//      re-evaluated every animation frame (the full live path: interpolate ->
+//      re-sort -> re-lookup zone FG% -> deriveContext -> buildFeatures ->
+//      forward). When playback time lands ON a recorded frame we switch to the
+//      parity-exact recorded path so stored vs live never drift.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { LoadedNetwork } from "../engine/network";
 import {
   frameToRawState,
+  interpolateFrame,
+  liveFrameToRawState,
   playerChoice,
   runState,
   whatIfToRawState,
@@ -21,6 +33,20 @@ import { ModelToggle } from "./bits";
 import { MODEL_LABELS, outcomeText, type ModelMode } from "./model";
 
 const SPEEDS = [0.5, 1, 2] as const;
+
+// One recorded frame spans this many ms of real possession time at 1x (the
+// ~2 Hz sample interval). Live playback advances `playT` (in frame units) by
+// dt/FRAME_MS per animation frame, so the interpolation honors wall-clock time.
+const FRAME_MS = 500;
+
+// A playback time within this many frame-units of an integer is treated as
+// landing ON that recorded frame -> use the parity-exact recorded path.
+const SNAP_EPS = 1e-3;
+
+// Chip hysteresis: while interpolating between 2 Hz samples the live argmax can
+// flicker between near-tied actions. Only switch the displayed recommendation
+// when the new argmax beats the currently-shown action by at least this much Q.
+const HYSTERESIS_EPS = 0.01;
 
 interface ExplorerProps {
   possession: Possession;
@@ -51,7 +77,9 @@ export function Explorer({
   onBack,
 }: ExplorerProps) {
   const nFrames = p.frames.length;
-  const [frameIdx, setFrameIdx] = useState(p.decision_frame);
+  // Continuous playback time in frame units (0 .. nFrames-1). The integer
+  // "snap" derived from it drives the existing stepped/decision experience.
+  const [playT, setPlayT] = useState(p.decision_frame);
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(1);
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -69,8 +97,14 @@ export function Explorer({
   const teammateNames = p.entity_names_network_order.slice(1);
   const labels = useMemo(() => shortLabels(teammateNames), [teammateNames]);
 
-  const isDecisionFrame = frameIdx === p.decision_frame;
-  const frame = p.frames[frameIdx];
+  // Nearest recorded frame to the continuous playback time. Drives the existing
+  // stepped UI (decision panel, what-if snapshot, outcome reveal).
+  const snapIdx = Math.min(nFrames - 1, Math.max(0, Math.round(playT)));
+  // True when playback is sitting (within EPS) ON a recorded frame -> the live
+  // path defers to the parity-exact recorded path so values never drift.
+  const onExactFrame = Math.abs(playT - snapIdx) < SNAP_EPS;
+  const isDecisionFrame = snapIdx === p.decision_frame && onExactFrame;
+  const frame = p.frames[snapIdx];
 
   // Snapshot the draggable positions for a given frame.
   const snapshotFrame = useCallback(
@@ -103,34 +137,52 @@ export function Explorer({
 
   // Reset the what-if snapshot during render when the frame changes while in
   // what-if mode (the "adjust state during render" recipe — no effect needed).
-  const [wiFrame, setWiFrame] = useState(frameIdx);
-  if (whatIf && wiFrame !== frameIdx) {
-    setWiFrame(frameIdx);
-    setWiState(snapshotFrame(frameIdx));
+  const [wiFrame, setWiFrame] = useState(snapIdx);
+  if (whatIf && wiFrame !== snapIdx) {
+    setWiFrame(snapIdx);
+    setWiState(snapshotFrame(snapIdx));
   }
 
-  // --- playback loop (advance frames; stop at decision frame) ---
+  // --- continuous playback loop (~30 fps via rAF; interpolates between the
+  // 2 Hz recorded frames; stops at the decision frame). What-if mode is
+  // pause-based, so the loop is inert there. ---
+  const playRafRef = useRef<number | null>(null);
+  const lastTsRef = useRef<number | null>(null);
   useEffect(() => {
     if (!playing || whatIf) return;
-    const stepMs = 700 / speed;
-    const id = window.setInterval(() => {
-      setFrameIdx((i) => {
-        if (i >= p.decision_frame) {
-          setPlaying(false);
-          return p.decision_frame;
-        }
-        return i + 1;
-      });
-    }, stepMs);
-    return () => window.clearInterval(id);
+    lastTsRef.current = null;
+    const tick = (ts: number) => {
+      const prev = lastTsRef.current;
+      lastTsRef.current = ts;
+      if (prev != null) {
+        const dtFrames = ((ts - prev) / FRAME_MS) * speed;
+        setPlayT((t) => {
+          const next = t + dtFrames;
+          if (next >= p.decision_frame) {
+            setPlaying(false);
+            return p.decision_frame;
+          }
+          return next;
+        });
+      }
+      playRafRef.current = requestAnimationFrame(tick);
+    };
+    playRafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (playRafRef.current != null) cancelAnimationFrame(playRafRef.current);
+      playRafRef.current = null;
+    };
   }, [playing, speed, whatIf, p.decision_frame]);
 
   const enterWhatIf = useCallback(() => {
-    setWiState(snapshotFrame(frameIdx));
-    setWiFrame(frameIdx);
+    setWiState(snapshotFrame(snapIdx));
+    setWiFrame(snapIdx);
     setWhatIf(true);
     setPlaying(false);
-  }, [frameIdx, snapshotFrame]);
+    // Lock onto the exact recorded frame when entering what-if (drag is
+    // pause-based and operates on a clean recorded snapshot).
+    setPlayT(snapIdx);
+  }, [snapIdx, snapshotFrame]);
 
   const toggleWhatIf = useCallback(() => {
     if (whatIf) {
@@ -142,10 +194,20 @@ export function Explorer({
   }, [whatIf, enterWhatIf]);
 
   const resetWhatIf = useCallback(() => {
-    setWiState(snapshotFrame(frameIdx));
-  }, [frameIdx, snapshotFrame]);
+    setWiState(snapshotFrame(snapIdx));
+  }, [snapIdx, snapshotFrame]);
 
-  // --- zone-FG lookups for what-if (BH + per teammate) ---
+  // Jump to the previous / next recorded decision-style marker (every recorded
+  // frame is a 2 Hz sample; stepping snaps to exact recorded values).
+  const stepTo = useCallback(
+    (idx: number) => {
+      setPlaying(false);
+      setPlayT(Math.min(nFrames - 1, Math.max(0, idx)));
+    },
+    [nFrames],
+  );
+
+  // --- zone-FG lookups (BH + per teammate), keyed by recorded identity ---
   const bhFgLookup = useMemo(
     () => makeZoneFgLookup(data.zoneFg, frame.ball_handler.compact_id),
     [data.zoneFg, frame.ball_handler.compact_id],
@@ -158,12 +220,22 @@ export function Explorer({
     [data.zoneFg, frame.teammates],
   );
 
+  // Interpolated live snapshot for off-sample playback times. `null` when on an
+  // exact recorded frame or in what-if mode (those use other paths).
+  const live = useMemo(() => {
+    if (whatIf || onExactFrame) return null;
+    const lo = Math.floor(playT);
+    const hi = Math.min(nFrames - 1, lo + 1);
+    const f = playT - lo;
+    return interpolateFrame(p.frames[lo], p.frames[hi], f);
+  }, [whatIf, onExactFrame, playT, nFrames, p.frames]);
+
   // --- compute Q for the displayed state ---
   const playerIds = p.entity_ids_network_order;
   const engineWi = wiState;
   const result = useMemo(() => {
+    // What-if (pause-based drag) — unchanged.
     if (whatIf && engineWi) {
-      // teammate FG% recomputed from each teammate's table at its (dragged) spot
       const wi: WhatIfState = {
         ...engineWi,
         teammates: engineWi.teammates.map((t, i) => ({
@@ -173,18 +245,26 @@ export function Explorer({
       };
       const state = whatIfToRawState(wi, bhFgLookup);
       state.shot_clock = frame.shot_clock;
-      const live = runState(net, state, playerIds);
-      if (model === "player") return playerChoice(live.q, p.player_action);
-      return live;
+      const liveQ = runState(net, state, playerIds);
+      if (model === "player") return playerChoice(liveQ.q, p.player_action);
+      return liveQ;
     }
-    // recorded path
+    // Live interpolated path (between 2 Hz samples) — full live recompute.
+    if (live) {
+      const state = liveFrameToRawState(live, bhFgLookup, teammateFgLookups);
+      const liveQ = runState(net, state, playerIds);
+      if (model === "player") return playerChoice(liveQ.q, p.player_action);
+      return liveQ;
+    }
+    // Parity-exact recorded path (on a sample point): stored context verbatim.
     const state = frameToRawState(frame);
-    const live = runState(net, state, playerIds);
-    if (model === "player") return playerChoice(live.q, p.player_action);
-    return live;
+    const liveQ = runState(net, state, playerIds);
+    if (model === "player") return playerChoice(liveQ.q, p.player_action);
+    return liveQ;
   }, [
     whatIf,
     engineWi,
+    live,
     frame,
     net,
     model,
@@ -194,10 +274,34 @@ export function Explorer({
     teammateFgLookups,
   ]);
 
-  // --- court entities (recorded or what-if positions) ---
+  // --- chip hysteresis: only switch the DISPLAYED recommendation when the new
+  // argmax beats the currently-shown action by >= HYSTERESIS_EPS Q. Prevents
+  // the chip flickering between near-tied actions during interpolation. The
+  // Q-bars themselves always show the true live Q (no hysteresis there). On an
+  // exact recorded frame / what-if we trust the argmax outright. Implemented
+  // with the React "adjust state during render" recipe (compare against the
+  // displayed-best STATE — no refs read during render). ---
+  const [shownBest, setShownBest] = useState(result.best);
+  if (shownBest !== result.best) {
+    // Snap immediately (no hysteresis) in player-choice mode (best is forced to
+    // the player's action), when paused on an exact recorded frame, or in
+    // what-if — so stepped/recorded values are never softened.
+    const forceSnap = model === "player" || (onExactFrame && !playing) || whatIf;
+    const beatsByEps =
+      result.q[result.best] - (result.q[shownBest] ?? -Infinity) >=
+      HYSTERESIS_EPS;
+    if (forceSnap || beatsByEps) setShownBest(result.best);
+  }
+
+  // --- court entities (recorded / interpolated / what-if positions) ---
   const entities: CourtEntity[] = useMemo(() => {
     const out: CourtEntity[] = [];
-    const bh = whatIf && wiState ? wiState.ballHandler : frame.ball_handler;
+    const bh =
+      whatIf && wiState
+        ? wiState.ballHandler
+        : live
+          ? live.ballHandler
+          : frame.ball_handler;
     out.push({
       id: "bh",
       kind: "ball-handler",
@@ -205,7 +309,15 @@ export function Explorer({
       y: bh.y,
       label: p.entity_names_network_order[0] ?? p.ball_handler_name,
     });
-    const tms = whatIf && wiState ? wiState.teammates : frame.teammates;
+    // Teammates/defenders keep recorded array order for stable identity (labels
+    // + arrow targeting); interpolation matches by index, so srcIndex == array
+    // index here.
+    const tms =
+      whatIf && wiState
+        ? wiState.teammates
+        : live
+          ? sortBySrc(live.teammates)
+          : frame.teammates;
     tms.forEach((t, i) => {
       out.push({
         id: `tm${i}`,
@@ -217,7 +329,11 @@ export function Explorer({
       });
     });
     const dfs =
-      whatIf && wiState ? wiState.defenders : frame.defenders;
+      whatIf && wiState
+        ? wiState.defenders
+        : live
+          ? sortBySrc(live.defenders)
+          : frame.defenders;
     dfs.forEach((d, i) => {
       out.push({
         id: `df${i}`,
@@ -228,16 +344,24 @@ export function Explorer({
       });
     });
     return out;
-  }, [whatIf, wiState, frame, p, teammateNames]);
+  }, [whatIf, wiState, live, frame, p, teammateNames]);
 
   const ball = useMemo(() => {
-    const bh = whatIf && wiState ? wiState.ballHandler : frame.ball_handler;
+    const bh =
+      whatIf && wiState
+        ? wiState.ballHandler
+        : live
+          ? live.ballHandler
+          : frame.ball_handler;
     return { x: bh.x, y: bh.y };
-  }, [whatIf, wiState, frame]);
+  }, [whatIf, wiState, live, frame]);
 
-  // --- agent recommendation arrow ---
+  // Shot clock shown on the court: interpolated during live playback.
+  const shotClock = live ? live.shotClock : frame.shot_clock;
+
+  // --- agent recommendation arrow (tracks the HYSTERESIS-stabilized chip) ---
   const arrow: CourtArrow | null = useMemo(() => {
-    const rec = result.best;
+    const rec = shownBest;
     const bh = entities.find((e) => e.id === "bh");
     if (!bh) return null;
     if (rec === 0) {
@@ -259,7 +383,7 @@ export function Explorer({
       toY: target.y,
       kind: "pass",
     };
-  }, [result.best, entities]);
+  }, [shownBest, entities]);
 
   // --- drag handler: coalesce rapid pointer-moves to one commit per frame ---
   const applyDrag = useCallback(
@@ -313,8 +437,9 @@ export function Explorer({
     };
   }, []);
 
-  // recommendation + player action labels
-  const agentLabel = actionLabel(result.best, teammateNames);
+  // recommendation + player action labels. The agent recommendation tracks the
+  // hysteresis-stabilized `shownBest` so the chip and arrow stay in lockstep.
+  const agentLabel = actionLabel(shownBest, teammateNames);
   const playerLabel = actionLabel(p.player_action, teammateNames);
   const agree = p.agent_action === p.player_action;
 
@@ -350,9 +475,7 @@ export function Explorer({
           <div className={"court-wrap" + (whatIf ? " court-wrap--whatif" : "")}>
             {whatIf && <span className="whatif-tag">Hypothetical</span>}
             <div className="court-clock">
-              <span className="court-clock__val">
-                {frame.shot_clock.toFixed(1)}
-              </span>
+              <span className="court-clock__val">{shotClock.toFixed(1)}</span>
               <span className="court-clock__label">shot clock</span>
             </div>
             <Court
@@ -391,30 +514,78 @@ export function Explorer({
           <div className="transport">
             <button
               className="iconbtn"
+              aria-label="Previous frame"
+              disabled={whatIf || nFrames <= 1}
+              onClick={() => stepTo(snapIdx - 1)}
+              title="Step to previous recorded frame"
+            >
+              ⏮
+            </button>
+            <button
+              className="iconbtn"
               aria-label={playing ? "Pause" : "Play"}
               disabled={whatIf || nFrames <= 1}
               onClick={() => {
-                if (frameIdx >= p.decision_frame) setFrameIdx(0);
+                if (playT >= p.decision_frame) setPlayT(0);
                 setPlaying((v) => !v);
               }}
             >
               {playing ? "❚❚" : "►"}
             </button>
+            <button
+              className="iconbtn"
+              aria-label="Next frame"
+              disabled={whatIf || nFrames <= 1}
+              onClick={() => stepTo(snapIdx + 1)}
+              title="Step to next recorded frame"
+            >
+              ⏭
+            </button>
             <div className="scrub">
-              <input
-                type="range"
-                min={0}
-                max={nFrames - 1}
-                value={frameIdx}
-                disabled={nFrames <= 1}
-                onChange={(e) => {
-                  setPlaying(false);
-                  setFrameIdx(Number(e.target.value));
-                }}
-                aria-label="Scrub possession frames"
-              />
+              <div className="scrub__track-wrap">
+                <input
+                  type="range"
+                  min={0}
+                  max={nFrames - 1}
+                  step={0.01}
+                  value={playT}
+                  disabled={whatIf || nFrames <= 1}
+                  onChange={(e) => {
+                    setPlaying(false);
+                    const raw = Number(e.target.value);
+                    // Snap affordance: clicking near a recorded marker locks to
+                    // that exact frame (exact-parity values).
+                    const nearest = Math.round(raw);
+                    setPlayT(Math.abs(raw - nearest) < 0.08 ? nearest : raw);
+                  }}
+                  aria-label="Scrub possession (continuous; snaps at recorded frames)"
+                />
+                {/* decision-point markers — every recorded 2 Hz sample is a
+                    clickable marker; the decision frame is accented. */}
+                <div className="scrub__markers" aria-hidden="true">
+                  {p.frames.map((_, i) => (
+                    <button
+                      key={i}
+                      type="button"
+                      tabIndex={-1}
+                      className={
+                        "scrub__marker" +
+                        (i === p.decision_frame ? " is-decision" : "") +
+                        (i === snapIdx && onExactFrame ? " is-current" : "")
+                      }
+                      style={{ left: `${(i / (nFrames - 1)) * 100}%` }}
+                      onClick={() => stepTo(i)}
+                      title={
+                        i === p.decision_frame
+                          ? "Decision point — click to snap"
+                          : `Frame ${i + 1} — click to snap`
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
               <span className="scrub__pos">
-                {frameIdx + 1}/{nFrames}
+                {snapIdx + 1}/{nFrames}
               </span>
             </div>
             <div className="segment" aria-label="Playback speed">
@@ -466,7 +637,9 @@ export function Explorer({
             <span className="panel__label">
               {isDecisionFrame
                 ? "Decision point"
-                : `Frame ${frameIdx + 1} — pre-decision`}
+                : onExactFrame
+                  ? `Frame ${snapIdx + 1} — pre-decision`
+                  : "Live — between samples"}
             </span>
             <div className="decision-row">
               <div>
@@ -478,6 +651,10 @@ export function Explorer({
                 <div className="decision-col__val">{playerLabel}</div>
               </div>
             </div>
+            <p className="live-caption mono">
+              live agent — re-evaluated as the play moves; positions between 2 Hz
+              samples are interpolated
+            </p>
             {!whatIf && agree && isDecisionFrame && (
               <p className="agree-note">
                 Agreement — the agent and {p.ball_handler_name} made the same
@@ -490,7 +667,7 @@ export function Explorer({
             <span className="panel__label">Action values (Q)</span>
             <QBars
               q={result.q}
-              best={result.best}
+              best={shownBest}
               labels={labels}
               playerAction={isDecisionFrame ? p.player_action : undefined}
             />
@@ -522,6 +699,11 @@ export function Explorer({
       </div>
     </div>
   );
+}
+
+/** Order interpolated entities back into recorded array order for stable ids. */
+function sortBySrc<T extends { srcIndex: number }>(xs: T[]): T[] {
+  return [...xs].sort((a, b) => a.srcIndex - b.srcIndex);
 }
 
 function groupLabel(cat: string): string {
