@@ -3,6 +3,7 @@ import "./index.css";
 import { loadAppData, type AppData } from "./data/load";
 import { Browser } from "./ui/Browser";
 import { Explorer } from "./ui/Explorer";
+import { WatchMode } from "./ui/WatchMode";
 import { type ModelMode } from "./ui/model";
 
 // TODO: switch to https://issaahmed.com once the custom domain is wired up
@@ -81,6 +82,7 @@ export default function App() {
   const [data, setData] = useState<AppData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [watching, setWatching] = useState(false);
   const [model, setModel] = useState<ModelMode>("dueling");
 
   useEffect(() => {
@@ -105,7 +107,7 @@ export default function App() {
   // keep scroll sane when switching views
   useEffect(() => {
     window.scrollTo({ top: 0 });
-  }, [selectedId]);
+  }, [selectedId, watching]);
 
   if (error) {
     return (
@@ -141,7 +143,14 @@ export default function App() {
     <>
       <Header />
       <main className="shell">
-        {selected ? (
+        {watching ? (
+          <WatchMode
+            data={data}
+            model={model}
+            onModelChange={setModel}
+            onExit={() => setWatching(false)}
+          />
+        ) : selected ? (
           <Explorer
             key={selected.id}
             possession={selected}
@@ -156,6 +165,7 @@ export default function App() {
             <Browser
               possessions={data.possessions.possessions}
               onOpen={setSelectedId}
+              onWatch={() => setWatching(true)}
             />
           </>
         )}

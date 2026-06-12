@@ -47,9 +47,32 @@ function PossessionCard({
       )}
       <p className="poss-card__summary">{p.summary}</p>
       <div className="poss-card__foot">
-        <span className="chip chip--accent">Q-gap {p.score.toFixed(2)}</span>
+        {p.score !== undefined && (
+          <span className="chip chip--accent">Q-gap {p.score.toFixed(2)}</span>
+        )}
         <span className="poss-card__arrow">Explore →</span>
       </div>
+    </button>
+  );
+}
+
+function WatchCallout({ onWatch }: { onWatch: () => void }) {
+  return (
+    <button className="watch-callout" onClick={onWatch}>
+      <span className="watch-callout__play" aria-hidden="true">
+        ▶
+      </span>
+      <span className="watch-callout__body">
+        <span className="watch-callout__title">Watch the agent run</span>
+        <span className="watch-callout__sub">
+          Sit back — the live agent plays through possession after possession,
+          calling each shoot-or-pass decision as it happens. Pause anytime to
+          drag a player and test a what-if.
+        </span>
+      </span>
+      <span className="watch-callout__arrow" aria-hidden="true">
+        →
+      </span>
     </button>
   );
 }
@@ -57,12 +80,15 @@ function PossessionCard({
 export function Browser({
   possessions,
   onOpen,
+  onWatch,
 }: {
   possessions: Possession[];
   onOpen: (id: string) => void;
+  onWatch: () => void;
 }) {
   return (
     <div className="section">
+      <WatchCallout onWatch={onWatch} />
       {GROUP_ORDER.map((cat) => {
         const group = possessions.filter((p) => p.category === cat);
         if (group.length === 0) return null;

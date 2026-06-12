@@ -5,7 +5,7 @@
 
 import { loadNetwork, type LoadedNetwork, type WeightsFile } from "../engine/network";
 import { BASKET_X, BASKET_Y } from "../engine/features";
-import type { PlayersFile, PossessionsFile } from "./types";
+import type { PlayersFile, Possession, PossessionsFile } from "./types";
 
 // Vite injects `import.meta.env.BASE_URL`; read it defensively so this module
 // also type-checks under the test tsconfig (which doesn't load `vite/client`).
@@ -88,4 +88,67 @@ export function makeZoneFgLookup(
     if (v !== undefined && v > 0) return v;
     return table.leagueAvg[zone] ?? 0;
   };
+}
+
+// ---------------------------------------------------------------------------
+// Watch-mode rotation: lazily fetched stream possessions merged with the
+// curated 40 into a single shuffled rotation.
+//
+// The stream payload (~1.8 MB) is fetched ONLY when watch mode first starts —
+// the landing/browser view never pays for it. Callers should cache the promise
+// so a second visit to watch mode reuses the already-fetched data.
+// ---------------------------------------------------------------------------
+
+interface StreamFile {
+  note: string;
+  model: string;
+  possessions: Possession[];
+}
+
+let streamPromise: Promise<Possession[]> | null = null;
+
+/**
+ * Dynamically fetch the stream possessions. Memoized: the network request fires
+ * at most once per session. Not part of `loadAppData` — the browser/landing
+ * view must not pay for this payload.
+ */
+export function loadStreamPossessions(): Promise<Possession[]> {
+  if (!streamPromise) {
+    streamPromise = getJson<StreamFile>("possessions_stream.json")
+      .then((f) => f.possessions)
+      .catch((e: unknown) => {
+        // Allow a later retry if the fetch failed.
+        streamPromise = null;
+        throw e;
+      });
+  }
+  return streamPromise;
+}
+
+/**
+ * Deterministic (seeded) Fisher–Yates shuffle — a small LCG keeps the rotation
+ * stable across reloads so the "possession N of M" counter is reproducible.
+ */
+export function seededShuffle<T>(items: readonly T[], seed: number): T[] {
+  const out = items.slice();
+  // LCG (Numerical Recipes constants); avoids pulling in a dependency.
+  let s = (seed >>> 0) || 1;
+  const next = () => {
+    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(next() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/** Build the shuffled watch rotation: curated possessions + stream possessions. */
+export function buildWatchRotation(
+  curated: readonly Possession[],
+  stream: readonly Possession[],
+  seed = 42,
+): Possession[] {
+  return seededShuffle([...curated, ...stream], seed);
 }

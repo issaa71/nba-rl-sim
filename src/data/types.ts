@@ -1,7 +1,15 @@
 // Shapes for the exported demo JSONs under /public/data.
 // Authoritative spec: export_demo/EXPORT_README.md.
 
+/** Curated story buckets shown on the browser. */
 export type Category = "declined_the_shot" | "wanted_the_shot" | "agreement";
+
+/**
+ * A possession's category as it appears in the data. Curated possessions carry
+ * a story bucket; stream possessions (watch-mode filler from the held-out set)
+ * are uncategorized and tagged `"stream"`.
+ */
+export type PossessionCategory = Category | "stream";
 
 export interface FrameBallHandler {
   compact_id: number;
@@ -70,7 +78,7 @@ export interface Outcome {
 
 export interface Possession {
   id: string;
-  category: Category;
+  category: PossessionCategory;
   game_id: string;
   n_frames: number;
   /** index into `frames` where the recorded decision happens (the last frame). */
@@ -85,7 +93,8 @@ export interface Possession {
   agent_action: number;
   /** Dueling model Q-values at the decision frame, network order [shoot, pass_1..4]. */
   agent_q_values: number[];
-  score: number;
+  /** |Q-gap| between agent and player action. Present on curated possessions only. */
+  score?: number;
   outcome: Outcome;
   summary: string;
   frames: Frame[];

@@ -12,7 +12,14 @@
 //      forward). When playback time lands ON a recorded frame we switch to the
 //      parity-exact recorded path so stored vs live never drift.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import type { LoadedNetwork } from "../engine/network";
 import {
   frameToRawState,
@@ -54,6 +61,28 @@ interface ExplorerProps {
   model: ModelMode;
   onModelChange: (m: ModelMode) => void;
   onBack: () => void;
+  /**
+   * Autopilot (watch mode): start playback from the top of the possession on
+   * mount and replay continuously. Defaults to false (manual decision-point
+   * experience). Pausing is still fully interactive (what-if drag etc.).
+   */
+  autoPlay?: boolean;
+  /**
+   * Fired once when continuous playback reaches the decision frame. Watch mode
+   * uses this to show the outcome interstitial and advance to the next play.
+   */
+  onReachedDecision?: () => void;
+  /**
+   * External pause (watch mode). When true the continuous playback loop is held
+   * even if internally "playing" — lets an autopilot wrapper freeze the action
+   * while still allowing the user to drag (what-if) on the held frame.
+   */
+  paused?: boolean;
+  /**
+   * Replaces the default "← All possessions" back button row with custom chrome
+   * (watch-mode control bar + counter). When omitted, the back button renders.
+   */
+  topSlot?: ReactNode;
 }
 
 /** Short labels for the 5 actions from the possession's teammate names. */
@@ -75,12 +104,17 @@ export function Explorer({
   model,
   onModelChange,
   onBack,
+  autoPlay = false,
+  onReachedDecision,
+  paused = false,
+  topSlot,
 }: ExplorerProps) {
   const nFrames = p.frames.length;
   // Continuous playback time in frame units (0 .. nFrames-1). The integer
   // "snap" derived from it drives the existing stepped/decision experience.
-  const [playT, setPlayT] = useState(p.decision_frame);
-  const [playing, setPlaying] = useState(false);
+  // In autopilot we start at the top of the possession and play through.
+  const [playT, setPlayT] = useState(autoPlay ? 0 : p.decision_frame);
+  const [playing, setPlaying] = useState(autoPlay);
   const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(1);
   const [activeId, setActiveId] = useState<string | null>(null);
 
@@ -149,7 +183,7 @@ export function Explorer({
   const playRafRef = useRef<number | null>(null);
   const lastTsRef = useRef<number | null>(null);
   useEffect(() => {
-    if (!playing || whatIf) return;
+    if (!playing || whatIf || paused) return;
     lastTsRef.current = null;
     const tick = (ts: number) => {
       const prev = lastTsRef.current;
@@ -172,7 +206,20 @@ export function Explorer({
       if (playRafRef.current != null) cancelAnimationFrame(playRafRef.current);
       playRafRef.current = null;
     };
-  }, [playing, speed, whatIf, p.decision_frame]);
+  }, [playing, speed, whatIf, paused, p.decision_frame]);
+
+  // Autopilot (watch mode): notify the wrapper once playback has settled at the
+  // decision frame so it can show the outcome interstitial + advance. Guarded by
+  // `!playing` so it fires exactly once per arrival (the rAF loop sets playing
+  // false on reaching the decision frame, and the Explorer is remounted per
+  // possession, so there is no stale "fired" state to track).
+  const settledAtDecision =
+    !playing && playT >= p.decision_frame - SNAP_EPS;
+  useEffect(() => {
+    if (autoPlay && settledAtDecision && !whatIf) {
+      onReachedDecision?.();
+    }
+  }, [autoPlay, settledAtDecision, whatIf, onReachedDecision]);
 
   const enterWhatIf = useCallback(() => {
     setWiState(snapshotFrame(snapIdx));
@@ -451,9 +498,11 @@ export function Explorer({
 
   return (
     <div className="explorer">
-      <button className="explorer__back" onClick={onBack}>
-        ← All possessions
-      </button>
+      {topSlot ?? (
+        <button className="explorer__back" onClick={onBack}>
+          ← All possessions
+        </button>
+      )}
 
       <div className="explorer__head">
         <div>
@@ -709,5 +758,6 @@ function sortBySrc<T extends { srcIndex: number }>(xs: T[]): T[] {
 function groupLabel(cat: string): string {
   if (cat === "declined_the_shot") return "Declined the shot";
   if (cat === "wanted_the_shot") return "Wanted the shot";
+  if (cat === "stream") return "Test-set possession";
   return "Agreement";
 }

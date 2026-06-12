@@ -975,6 +975,207 @@ button {
   }
 }
 
+/* ---------- watch mode ---------- */
+
+/* Landing entry point — a prominent peer to the category groups. */
+.watch-callout {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 36px;
+  padding: 22px 24px;
+  border-radius: 18px;
+  background: linear-gradient(
+    120deg,
+    var(--accent-soft) 0%,
+    var(--surface) 70%
+  );
+  border: 1px solid rgba(4, 120, 87, 0.28);
+  box-shadow: var(--shadow-card);
+  transition: border-color 0.18s ease, transform 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.watch-callout:hover {
+  border-color: rgba(4, 120, 87, 0.55);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lift);
+}
+
+.watch-callout__play {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 17px;
+  padding-left: 3px;
+  box-shadow: 0 4px 14px -4px rgba(4, 120, 87, 0.6);
+}
+
+.watch-callout__body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.watch-callout__title {
+  font-family: var(--font-display);
+  font-size: 1.3rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--foreground);
+}
+
+.watch-callout__sub {
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--muted);
+  max-width: 60ch;
+}
+
+.watch-callout__arrow {
+  margin-left: auto;
+  flex: none;
+  font-size: 18px;
+  color: var(--accent);
+  transition: transform 0.18s ease;
+}
+
+.watch-callout:hover .watch-callout__arrow {
+  transform: translateX(4px);
+}
+
+@media (max-width: 600px) {
+  .watch-callout {
+    gap: 14px;
+    padding: 18px;
+  }
+  .watch-callout__arrow {
+    display: none;
+  }
+}
+
+/* Watch-mode control bar (sits where the explorer back button normally is). */
+.watch {
+  position: relative;
+}
+
+.watchbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.watchbar__counter {
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.watchbar__controls {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Outcome interstitial — a calm overlay between plays. */
+.interstitial {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--background) 70%, transparent);
+  backdrop-filter: saturate(160%) blur(3px);
+  animation: interstitial-fade 0.22s ease both;
+}
+
+.interstitial__card {
+  width: min(420px, 100%);
+  padding: 24px 26px;
+  border-radius: 18px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lift);
+  animation: rise 0.28s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.interstitial__rows {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.interstitial__row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.interstitial__row:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.interstitial__k {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--faint);
+}
+
+.interstitial__v {
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--foreground);
+  text-align: right;
+}
+
+.interstitial__v--agent {
+  color: var(--accent);
+}
+
+.interstitial__note {
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.interstitial__next {
+  display: block;
+  margin-top: 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+
+@keyframes interstitial-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .rise {
   animation: rise 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
@@ -992,7 +1193,9 @@ button {
 
 @media (prefers-reduced-motion: reduce) {
   .rise,
-  .spinner {
+  .spinner,
+  .interstitial,
+  .interstitial__card {
     animation: none;
   }
   *,
