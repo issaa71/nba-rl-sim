@@ -5,8 +5,10 @@ import { Browser } from "./ui/Browser";
 import { Explorer } from "./ui/Explorer";
 import { type ModelMode } from "./ui/model";
 
+// TODO: switch to https://issaahmed.com once the custom domain is wired up
 const PORTFOLIO_CASE_STUDY =
-  "https://issaahmed.com/projects/nba-shot-selection";
+  "https://issaahmed-com.vercel.app/projects/nba-shot-selection";
+const SOURCE_REPO = "https://github.com/issaa71/nba-rl-sim";
 
 function Header() {
   return (
@@ -49,6 +51,10 @@ function Footer({ data }: { data: AppData | null }) {
           1e-4.{" "}
           <a href={PORTFOLIO_CASE_STUDY} target="_blank" rel="noreferrer">
             Read the case study ↗
+          </a>{" "}
+          ·{" "}
+          <a href={SOURCE_REPO} target="_blank" rel="noreferrer">
+            Source on GitHub ↗
           </a>
         </p>
       </div>

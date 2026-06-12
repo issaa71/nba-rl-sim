@@ -1,73 +1,58 @@
-# React + TypeScript + Vite
+# NBA Shot Selection — RL Possession Explorer
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+**Live: https://nba-rl-sim.vercel.app**
 
-Currently, two official plugins are available:
+An interactive explorer for an offline-RL agent that decides *shoot or pass* on real NBA
+possessions (2015–16 SportVU tracking data). The trained network runs **entirely in your
+browser** — no server, no API. Pick a possession, watch the agent follow the play in real time,
+then drag a defender and watch it change its mind.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Live companion to the case study at
+[issaahmed-com.vercel.app/projects/nba-shot-selection](https://issaahmed-com.vercel.app/projects/nba-shot-selection).
 
-## React Compiler
+## What you can do
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **Browse 40 curated possessions** from held-out test games, grouped by story:
+  *Declined the shot* (the player shot; the agent saw a better pass), *Wanted the shot*
+  (the player passed up a look the agent liked), and *Agreement* controls.
+- **Watch the live agent**: playback interpolates the 2 Hz tracking samples to ~30 fps and
+  re-runs the network every frame — the SHOOT/PASS call, target arrow, and Q-value bars follow
+  the play continuously. Decision-point markers stay clickable for exact stepped inspection.
+- **What-if mode**: pause anywhere, drag any player or defender, and the full pipeline —
+  re-sort entities → zone-FG lookup → 73-feature state builder → network forward pass —
+  recomputes live (~50 µs per evaluation).
+- **Model toggle**: Dueling DQN (per-entity Deep Sets + type-aware advantage normalization),
+  plain DQN, or the player's actual choices.
 
-## Expanding the ESLint configuration
+## Why you can trust the numbers
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- The TypeScript inference engine and feature builder are tested against **250 golden vectors**
+  exported from the original PyTorch/Python pipeline: features match to ≤1e-6 and Q-values to
+  ≤1e-4 (measured worst case ≈1.6e-6). Run the parity suite with `npm test`.
+- The footer's headline — **Dueling DQN EPSA +0.273 vs +0.044 for NBA players' actual
+  choices** — comes from a deterministic greedy evaluation over all 127,353 decision points in
+  the held-out test games (shot-quality EPSA: mean expected points of chosen shots minus the
+  0.375 league baseline).
+- Every Q-value shown is computed client-side from the shipped weights (~16K parameters).
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+## Stack
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+Vite · React · TypeScript · HTML5 Canvas. No UI framework, no chart library, no backend.
+Total payload ≈ 1.6 MB including both models' weights and all possession data.
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Run it locally
+
+```bash
+npm install
+npm test        # golden-vector parity gate (250 vectors, both models)
+npm run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+## Provenance
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+The models were trained offline (Dueling DQN with potential-based reward shaping) on 116,928
+possessions segmented from 2015–16 SportVU tracking logs as part of a Western University AI
+course project, then exported to JSON for client-side inference. Player names come from the NBA
+Stats static index; zone-FG% tables are computed from public shot data.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+Built by [Issa Ahmed](https://issaahmed-com.vercel.app).
