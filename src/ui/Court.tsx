@@ -37,6 +37,10 @@ interface CourtProps {
   onActiveChange: (id: string | null) => void;
   /** called continuously while dragging an entity to new env coords. */
   onDrag?: (id: string, x: number, y: number) => void;
+  /** always-on compact name labels under offense dots (defaults on). */
+  showNames?: boolean;
+  /** court opacity 0..1 — dipped during a playback CUT for the dissolve. */
+  fade?: number;
 }
 
 // Court geometry in env feet.
@@ -192,11 +196,47 @@ function drawArrow(ctx: CanvasRenderingContext2D, a: CourtArrow, w: number, h: n
   ctx.fill();
 }
 
+/** Compact label: last name for offense (the user's "player numbers"). */
+function compactName(label: string): string {
+  const parts = label.trim().split(/\s+/);
+  return parts.length > 1 ? parts[parts.length - 1] : label;
+}
+
+/**
+ * Always-on label beneath a dot. Drawn with a paper-colored halo (stroke under
+ * fill) so it stays legible over court lines and dots. `tone` controls contrast:
+ * offense reads in warm ink, defenders sit fainter.
+ */
+function drawNameLabel(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  px: number,
+  py: number,
+  r: number,
+  tone: "offense" | "defender",
+) {
+  ctx.font =
+    (tone === "offense" ? "600 " : "500 ") +
+    "10px 'Geist', system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const ty = py + r + 3;
+  // paper halo for contrast on the wood + lines
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgba(244,239,230,0.92)";
+  ctx.strokeText(text, px, ty);
+  ctx.fillStyle =
+    tone === "offense" ? "rgba(28,26,23,0.95)" : "rgba(95,90,82,0.78)";
+  ctx.fillText(text, px, ty);
+}
+
 function drawEntities(
   ctx: CanvasRenderingContext2D,
   entities: CourtEntity[],
   ball: { x: number; y: number },
   activeId: string | null,
+  showNames: boolean,
   w: number,
   h: number,
 ) {
@@ -232,6 +272,14 @@ function drawEntities(
       ctx.lineWidth = 2;
       ctx.strokeStyle = COL.bhRing;
       ctx.stroke();
+    }
+
+    // Always-on compact name labels. Offense (BH + teammates) is labeled by
+    // last name in ink; defenders are unnamed in the data, so they only get a
+    // label on hover (the pill below). The active entity shows the full-name
+    // pill instead of the compact label to avoid double-drawing.
+    if (showNames && !active && e.kind !== "defender") {
+      drawNameLabel(ctx, compactName(e.label), px, py, r, "offense");
     }
 
     if (active) {
@@ -293,6 +341,8 @@ export function Court({
   activeId,
   onActiveChange,
   onDrag,
+  showNames = true,
+  fade = 1,
 }: CourtProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const draggingRef = useRef<string | null>(null);
@@ -311,10 +361,13 @@ export function Court({
     ctx.save();
     ctx.scale(dpr, dpr);
     drawCourt(ctx, CANVAS_W, CANVAS_H);
+    // CUT dissolve: the court (arrow + entities) fades over the held frame; the
+    // wood backdrop stays so the dip reads as a dissolve, not a blackout.
+    ctx.globalAlpha = Math.max(0, Math.min(1, fade));
     if (arrow) drawArrow(ctx, arrow, CANVAS_W, CANVAS_H);
-    drawEntities(ctx, entities, ball, activeId, CANVAS_W, CANVAS_H);
+    drawEntities(ctx, entities, ball, activeId, showNames, CANVAS_W, CANVAS_H);
     ctx.restore();
-  }, [entities, ball, arrow, activeId]);
+  }, [entities, ball, arrow, activeId, showNames, fade]);
 
   const eventToCanvas = useCallback((clientX: number, clientY: number) => {
     const canvas = canvasRef.current!;

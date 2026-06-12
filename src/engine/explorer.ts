@@ -326,3 +326,206 @@ function distSq(p: { x: number; y: number }, q: { x: number; y: number }): numbe
   const dy = p.y - q.y;
   return dx * dx + dy * dy;
 }
+
+// ---------------------------------------------------------------------------
+// Dwell / glide / cut TIMELINE (honest playback).
+//
+// Recorded frames are DECISION POINTS at irregular real intervals — NOT uniform
+// 2 Hz samples. Treating them as uniform (and linearly interpolating every gap)
+// makes long real gaps play ~20x too fast and renders shot-clock RESETS (an
+// offensive rebound, a new possession-clock) as smooth glides through the
+// middle of the court. Both are dishonest.
+//
+// Instead we lay out, per possession, an explicit timeline of segments:
+//   - DWELL  at frame i:  playT is held EXACTLY at the integer i for
+//     DWELL_MS — this is the parity-exact recorded path. Decision moments are
+//     held so they can be read.
+//   - GLIDE  i -> i+1:    playT animates i..i+1 with a duration PROPORTIONAL to
+//     the real time elapsed (shotClock[i] - shotClock[i+1]) but compressed —
+//     bigger real gaps read as longer movements, without playing in real time.
+//   - CUT    i -> i+1:    when the shot clock RESETS (delta <= 0), the real gap
+//     is too large (> CUT_GAP_S), or a clock is missing, we do NOT interpolate
+//     positions. We hold frame i, then a brief fade/dissolve reveals frame i+1.
+//     The jump is marked as a "beat" so the discontinuity is honest.
+//
+// Playback is driven by elapsed wall-clock against this timeline; the speed
+// control scales the whole timeline (durations are divided by the speed). The
+// scrubber maps linearly to timeline time, and decision-frame markers map back
+// to the start of that frame's dwell so clicking a marker snaps to it.
+// ---------------------------------------------------------------------------
+
+/** Frame held in place (parity-exact recorded path) for DWELL_MS at 1x. */
+export const DWELL_MS = 850;
+/** A real gap at or below this (seconds) glides; above it, we CUT. */
+export const CUT_GAP_S = 8;
+/** glideMs = clamp(realGap * GLIDE_MS_PER_S, GLIDE_MIN_MS, GLIDE_MAX_MS). */
+export const GLIDE_MS_PER_S = 350;
+export const GLIDE_MIN_MS = 300;
+export const GLIDE_MAX_MS = 1300;
+/** Length of the dissolve shown across a CUT (fade frame i -> i+1) at 1x. */
+export const CUT_MS = 200;
+
+export type TimelineSegmentKind = "dwell" | "glide" | "cut";
+
+export interface TimelineSegment {
+  kind: TimelineSegmentKind;
+  /** recorded frame index this segment starts on. */
+  from: number;
+  /** glide/cut land on this frame; equals `from` for a dwell. */
+  to: number;
+  /** segment start in timeline ms at 1x (cumulative). */
+  start: number;
+  /** segment duration in timeline ms at 1x. */
+  duration: number;
+}
+
+export interface Timeline {
+  segments: TimelineSegment[];
+  /** total timeline length in ms at 1x. */
+  total: number;
+  /** number of recorded frames the timeline spans (decisionFrame + 1). */
+  nFrames: number;
+}
+
+const clamp = (v: number, lo: number, hi: number): number =>
+  v < lo ? lo : v > hi ? hi : v;
+
+/**
+ * Map the real time elapsed between two adjacent frames to a glide duration:
+ * proportional to the real gap, clamped so even tiny gaps animate visibly and
+ * large ones stay sub-real-time. Returns `null` when the transition should be a
+ * CUT instead — i.e. the shot clock RESET (delta <= 0), the gap exceeds
+ * CUT_GAP_S, or either clock is missing/non-finite.
+ */
+export function glideDurationMs(
+  shotClockFrom: number,
+  shotClockTo: number,
+): number | null {
+  if (!Number.isFinite(shotClockFrom) || !Number.isFinite(shotClockTo)) {
+    return null;
+  }
+  const realGap = shotClockFrom - shotClockTo;
+  // delta <= 0 -> the clock went up or stalled: a reset / discontinuity -> CUT.
+  if (realGap <= 0) return null;
+  if (realGap > CUT_GAP_S) return null;
+  return clamp(realGap * GLIDE_MS_PER_S, GLIDE_MIN_MS, GLIDE_MAX_MS);
+}
+
+/**
+ * Build the dwell/glide/cut timeline for a possession from its per-frame shot
+ * clocks (frames 0..decisionFrame inclusive — playback stops at the decision).
+ *
+ * Layout: dwell(0), [glide|cut](0->1), dwell(1), [glide|cut](1->2), ... ,
+ * dwell(decisionFrame). A single-frame possession is just one dwell.
+ *
+ * Pure + deterministic — unit-tested in src/test/explorer.test.ts.
+ */
+export function buildTimeline(shotClocks: readonly number[]): Timeline {
+  const n = shotClocks.length;
+  const segments: TimelineSegment[] = [];
+  let t = 0;
+  const push = (s: Omit<TimelineSegment, "start">) => {
+    segments.push({ ...s, start: t });
+    t += s.duration;
+  };
+
+  if (n <= 1) {
+    push({ kind: "dwell", from: 0, to: 0, duration: DWELL_MS });
+    return { segments, total: t, nFrames: Math.max(1, n) };
+  }
+
+  for (let i = 0; i < n; i++) {
+    push({ kind: "dwell", from: i, to: i, duration: DWELL_MS });
+    if (i < n - 1) {
+      const glide = glideDurationMs(shotClocks[i], shotClocks[i + 1]);
+      if (glide == null) {
+        push({ kind: "cut", from: i, to: i + 1, duration: CUT_MS });
+      } else {
+        push({ kind: "glide", from: i, to: i + 1, duration: glide });
+      }
+    }
+  }
+  return { segments, total: t, nFrames: n };
+}
+
+/** What the playback head resolves to at a given timeline time. */
+export interface TimelineCursor {
+  /** continuous frame position (integer during dwell/cut, fractional in glide). */
+  playT: number;
+  /** active segment kind. */
+  kind: TimelineSegmentKind;
+  /** the recorded frame to render position from (the held frame during a cut). */
+  frame: number;
+  /**
+   * cut dissolve progress in [0,1] (0 at the held frame, 1 fully on the next
+   * frame). 0 outside of a cut. The UI cross-fades position from `from` to `to`
+   * WITHOUT interpolating through intermediate court positions.
+   */
+  cutProgress: number;
+}
+
+/**
+ * Resolve a timeline time (ms at 1x) to a playback cursor. Times before 0 clamp
+ * to the first frame; times at/after `total` clamp to the final dwell.
+ *
+ * During a GLIDE, `playT` animates `from`..`to` so positional interpolation is
+ * driven exactly as before. During a CUT, `playT` is held at `from` (no
+ * positional glide) while `cutProgress` advances 0..1 for the dissolve, then
+ * snaps to `to` at the end. During a DWELL, `playT` sits on the integer frame.
+ */
+export function timelineCursor(tl: Timeline, time: number): TimelineCursor {
+  const segs = tl.segments;
+  if (segs.length === 0) {
+    return { playT: 0, kind: "dwell", frame: 0, cutProgress: 0 };
+  }
+  if (time <= 0) {
+    return { playT: 0, kind: "dwell", frame: 0, cutProgress: 0 };
+  }
+  if (time >= tl.total) {
+    const last = segs[segs.length - 1];
+    return { playT: last.to, kind: "dwell", frame: last.to, cutProgress: 0 };
+  }
+  // Linear scan (timelines are short — a few dozen segments at most).
+  let seg = segs[0];
+  for (const s of segs) {
+    if (time >= s.start && time < s.start + s.duration) {
+      seg = s;
+      break;
+    }
+    seg = s;
+  }
+  const local = seg.duration > 0 ? (time - seg.start) / seg.duration : 0;
+  if (seg.kind === "glide") {
+    return {
+      playT: seg.from + clamp(local, 0, 1),
+      kind: "glide",
+      frame: seg.from,
+      cutProgress: 0,
+    };
+  }
+  if (seg.kind === "cut") {
+    return {
+      playT: seg.from, // hold the source frame; no positional interpolation
+      kind: "cut",
+      frame: seg.from,
+      cutProgress: clamp(local, 0, 1),
+    };
+  }
+  return { playT: seg.from, kind: "dwell", frame: seg.from, cutProgress: 0 };
+}
+
+/**
+ * Timeline time (ms at 1x) at which a recorded frame is first reached — the
+ * start of that frame's dwell. Used to snap the scrubber / markers to a frame.
+ */
+export function timeForFrame(tl: Timeline, frame: number): number {
+  for (const s of tl.segments) {
+    if (s.kind === "dwell" && s.from === frame) return s.start;
+  }
+  // Fall back to the closest dwell at or before `frame`.
+  let best = 0;
+  for (const s of tl.segments) {
+    if (s.kind === "dwell" && s.from <= frame) best = s.start;
+  }
+  return best;
+}

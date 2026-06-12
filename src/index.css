@@ -525,6 +525,23 @@ button {
   border-radius: 6px;
 }
 
+/* CUT badge — shown over the court while the play dissolves across a jump. */
+.court-cut {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+  background: color-mix(in srgb, var(--surface) 90%, transparent);
+  border: 1px solid var(--border);
+  padding: 4px 9px;
+  border-radius: 999px;
+}
+
 .court-clock {
   position: absolute;
   top: 12px;
@@ -624,6 +641,22 @@ button {
 .scrub__marker.is-current {
   background: var(--foreground);
   transform: translate(-50%, -50%) scale(1.15);
+}
+
+/* CUT beat — a faint mono tick where the play jumps (reset / long gap). */
+.scrub__beat {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: repeating-linear-gradient(
+    var(--faint) 0 2px,
+    transparent 2px 4px
+  );
+  opacity: 0.7;
+  pointer-events: none;
 }
 
 .scrub__pos {
@@ -854,6 +887,11 @@ button {
   font-weight: 500;
   color: var(--foreground);
   cursor: pointer;
+}
+
+.switch--names {
+  font-size: 12.5px;
+  color: var(--muted);
 }
 
 .switch__track {

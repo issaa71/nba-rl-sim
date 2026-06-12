@@ -5,12 +5,16 @@
 // Two layers, additive:
 //   1. Decision-point experience (unchanged): clickable/steppable decision
 //      frames with EXACT recorded values, outcome reveal, what-if drag.
-//   2. Live mode (added on top): pressing PLAY animates the dots at ~30 fps by
-//      linearly interpolating between the ~2 Hz recorded frames, with the agent
-//      re-evaluated every animation frame (the full live path: interpolate ->
-//      re-sort -> re-lookup zone FG% -> deriveContext -> buildFeatures ->
-//      forward). When playback time lands ON a recorded frame we switch to the
-//      parity-exact recorded path so stored vs live never drift.
+//   2. Honest live playback (added on top): recorded frames are DECISION POINTS
+//      at irregular real intervals — NOT uniform 2 Hz samples. Pressing PLAY
+//      walks an explicit DWELL / GLIDE / CUT timeline (engine/explorer.ts):
+//      decision moments are HELD (dwell — the parity-exact recorded path),
+//      movement between them GLIDES with a duration proportional to the real
+//      time elapsed, and shot-clock RESETS / over-long gaps CUT (a brief
+//      dissolve, no dishonest positional interpolation). The agent is
+//      re-evaluated every animation frame during glides (interpolate -> re-sort
+//      -> re-lookup zone FG% -> deriveContext -> buildFeatures -> forward) and
+//      uses the parity-exact recorded path during dwells.
 
 import {
   useCallback,
@@ -22,11 +26,14 @@ import {
 } from "react";
 import type { LoadedNetwork } from "../engine/network";
 import {
+  buildTimeline,
   frameToRawState,
   interpolateFrame,
   liveFrameToRawState,
   playerChoice,
   runState,
+  timeForFrame,
+  timelineCursor,
   whatIfToRawState,
   type WhatIfState,
 } from "../engine/explorer";
@@ -41,14 +48,13 @@ import { MODEL_LABELS, outcomeText, type ModelMode } from "./model";
 
 const SPEEDS = [0.5, 1, 2] as const;
 
-// One recorded frame spans this many ms of real possession time at 1x (the
-// ~2 Hz sample interval). Live playback advances `playT` (in frame units) by
-// dt/FRAME_MS per animation frame, so the interpolation honors wall-clock time.
-const FRAME_MS = 500;
-
 // A playback time within this many frame-units of an integer is treated as
 // landing ON that recorded frame -> use the parity-exact recorded path.
 const SNAP_EPS = 1e-3;
+
+// Clicking within this fraction of the scrubber range to a recorded-frame
+// marker snaps the playback head onto that frame's dwell (exact-parity values).
+const SCRUB_SNAP_FRAC = 0.02;
 
 // Chip hysteresis: while interpolating between 2 Hz samples the live argmax can
 // flicker between near-tied actions. Only switch the displayed recommendation
@@ -110,13 +116,31 @@ export function Explorer({
   topSlot,
 }: ExplorerProps) {
   const nFrames = p.frames.length;
-  // Continuous playback time in frame units (0 .. nFrames-1). The integer
-  // "snap" derived from it drives the existing stepped/decision experience.
-  // In autopilot we start at the top of the possession and play through.
-  const [playT, setPlayT] = useState(autoPlay ? 0 : p.decision_frame);
+
+  // Playback walks an explicit DWELL/GLIDE/CUT timeline over frames 0..decision
+  // (playback stops at the decision frame, which is not always the last frame).
+  // The timeline is keyed on the per-frame shot clocks; it is the honest map of
+  // real possession time -> playback time.
+  const timeline = useMemo(
+    () =>
+      buildTimeline(
+        p.frames.slice(0, p.decision_frame + 1).map((f) => f.shot_clock),
+      ),
+    [p.frames, p.decision_frame],
+  );
+
+  // Source of truth for playback: elapsed wall-clock against the timeline, in
+  // timeline-ms at 1x. The speed control scales how fast this advances. Manual
+  // mode opens parked on the decision frame; autopilot starts at the top.
+  const [clock, setClock] = useState(() =>
+    autoPlay ? 0 : timeForFrame(timeline, p.decision_frame),
+  );
   const [playing, setPlaying] = useState(autoPlay);
   const [speed, setSpeed] = useState<(typeof SPEEDS)[number]>(1);
   const [activeId, setActiveId] = useState<string | null>(null);
+  // Player-name labels on the court (user asked for the numbers back). On by
+  // default; defenders are unnamed in the data so only offense is labeled.
+  const [names, setNames] = useState(true);
 
   const [whatIf, setWhatIf] = useState(false);
   // What-if snapshot of the current frame's positions (null = follow recorded).
@@ -131,14 +155,30 @@ export function Explorer({
   const teammateNames = p.entity_names_network_order.slice(1);
   const labels = useMemo(() => shortLabels(teammateNames), [teammateNames]);
 
+  // Resolve the playback head against the timeline.
+  //   - playT: continuous frame position (integer on a dwell/cut, fractional in
+  //     a glide) — drives positional interpolation exactly as before.
+  //   - cutKind/cutProgress: during a CUT we hold the source frame and dissolve
+  //     to the next one WITHOUT interpolating through court positions.
+  const cursor = useMemo(() => timelineCursor(timeline, clock), [timeline, clock]);
+  const playT = cursor.playT;
+  const inCut = cursor.kind === "cut";
+
   // Nearest recorded frame to the continuous playback time. Drives the existing
   // stepped UI (decision panel, what-if snapshot, outcome reveal).
   const snapIdx = Math.min(nFrames - 1, Math.max(0, Math.round(playT)));
   // True when playback is sitting (within EPS) ON a recorded frame -> the live
-  // path defers to the parity-exact recorded path so values never drift.
-  const onExactFrame = Math.abs(playT - snapIdx) < SNAP_EPS;
-  const isDecisionFrame = snapIdx === p.decision_frame && onExactFrame;
+  // path defers to the parity-exact recorded path so values never drift. A CUT
+  // holds its source frame, so it counts as ON that frame (no interpolation).
+  const onExactFrame = inCut || Math.abs(playT - snapIdx) < SNAP_EPS;
+  const isDecisionFrame = snapIdx === p.decision_frame && onExactFrame && !inCut;
   const frame = p.frames[snapIdx];
+
+  // CUT dissolve: dip the court toward the midpoint of the cut so the jump
+  // reads as a deliberate dissolve, not a continuous glide (1 = fully visible).
+  const cutOpacity = inCut
+    ? 1 - Math.sin(cursor.cutProgress * Math.PI) * 0.7
+    : 1;
 
   // Snapshot the draggable positions for a given frame.
   const snapshotFrame = useCallback(
@@ -177,11 +217,13 @@ export function Explorer({
     setWiState(snapshotFrame(snapIdx));
   }
 
-  // --- continuous playback loop (~30 fps via rAF; interpolates between the
-  // 2 Hz recorded frames; stops at the decision frame). What-if mode is
-  // pause-based, so the loop is inert there. ---
+  // --- timeline playback loop (~per-frame via rAF; advances elapsed wall-clock
+  // against the dwell/glide/cut timeline, scaled by `speed`; stops at the end of
+  // the timeline = the decision frame's dwell). What-if mode is pause-based, so
+  // the loop is inert there. ---
   const playRafRef = useRef<number | null>(null);
   const lastTsRef = useRef<number | null>(null);
+  const totalMs = timeline.total;
   useEffect(() => {
     if (!playing || whatIf || paused) return;
     lastTsRef.current = null;
@@ -189,12 +231,12 @@ export function Explorer({
       const prev = lastTsRef.current;
       lastTsRef.current = ts;
       if (prev != null) {
-        const dtFrames = ((ts - prev) / FRAME_MS) * speed;
-        setPlayT((t) => {
-          const next = t + dtFrames;
-          if (next >= p.decision_frame) {
+        const dt = (ts - prev) * speed;
+        setClock((c) => {
+          const next = c + dt;
+          if (next >= totalMs) {
             setPlaying(false);
-            return p.decision_frame;
+            return totalMs;
           }
           return next;
         });
@@ -206,15 +248,14 @@ export function Explorer({
       if (playRafRef.current != null) cancelAnimationFrame(playRafRef.current);
       playRafRef.current = null;
     };
-  }, [playing, speed, whatIf, paused, p.decision_frame]);
+  }, [playing, speed, whatIf, paused, totalMs]);
 
   // Autopilot (watch mode): notify the wrapper once playback has settled at the
   // decision frame so it can show the outcome interstitial + advance. Guarded by
   // `!playing` so it fires exactly once per arrival (the rAF loop sets playing
-  // false on reaching the decision frame, and the Explorer is remounted per
+  // false on reaching the end of the timeline, and the Explorer is remounted per
   // possession, so there is no stale "fired" state to track).
-  const settledAtDecision =
-    !playing && playT >= p.decision_frame - SNAP_EPS;
+  const settledAtDecision = !playing && clock >= totalMs - SNAP_EPS;
   useEffect(() => {
     if (autoPlay && settledAtDecision && !whatIf) {
       onReachedDecision?.();
@@ -228,8 +269,8 @@ export function Explorer({
     setPlaying(false);
     // Lock onto the exact recorded frame when entering what-if (drag is
     // pause-based and operates on a clean recorded snapshot).
-    setPlayT(snapIdx);
-  }, [snapIdx, snapshotFrame]);
+    setClock(timeForFrame(timeline, snapIdx));
+  }, [snapIdx, snapshotFrame, timeline]);
 
   const toggleWhatIf = useCallback(() => {
     if (whatIf) {
@@ -244,14 +285,15 @@ export function Explorer({
     setWiState(snapshotFrame(snapIdx));
   }, [snapIdx, snapshotFrame]);
 
-  // Jump to the previous / next recorded decision-style marker (every recorded
-  // frame is a 2 Hz sample; stepping snaps to exact recorded values).
+  // Jump to a recorded decision frame's dwell (stepping/marker click snaps to
+  // exact recorded values). Clamped to the timeline span (0..decisionFrame).
   const stepTo = useCallback(
     (idx: number) => {
       setPlaying(false);
-      setPlayT(Math.min(nFrames - 1, Math.max(0, idx)));
+      const clamped = Math.min(p.decision_frame, Math.max(0, idx));
+      setClock(timeForFrame(timeline, clamped));
     },
-    [nFrames],
+    [p.decision_frame, timeline],
   );
 
   // --- zone-FG lookups (BH + per teammate), keyed by recorded identity ---
@@ -267,15 +309,16 @@ export function Explorer({
     [data.zoneFg, frame.teammates],
   );
 
-  // Interpolated live snapshot for off-sample playback times. `null` when on an
-  // exact recorded frame or in what-if mode (those use other paths).
+  // Interpolated live snapshot for GLIDE segments only. `null` on a dwell, in a
+  // cut (we hold the source frame — no positional interpolation across a clock
+  // reset), and in what-if mode (those use other paths).
   const live = useMemo(() => {
-    if (whatIf || onExactFrame) return null;
+    if (whatIf || onExactFrame || inCut) return null;
     const lo = Math.floor(playT);
     const hi = Math.min(nFrames - 1, lo + 1);
     const f = playT - lo;
     return interpolateFrame(p.frames[lo], p.frames[hi], f);
-  }, [whatIf, onExactFrame, playT, nFrames, p.frames]);
+  }, [whatIf, onExactFrame, inCut, playT, nFrames, p.frames]);
 
   // --- compute Q for the displayed state ---
   const playerIds = p.entity_ids_network_order;
@@ -523,6 +566,9 @@ export function Explorer({
         <div>
           <div className={"court-wrap" + (whatIf ? " court-wrap--whatif" : "")}>
             {whatIf && <span className="whatif-tag">Hypothetical</span>}
+            {inCut && (
+              <span className="court-cut mono">·· later in the possession</span>
+            )}
             <div className="court-clock">
               <span className="court-clock__val">{shotClock.toFixed(1)}</span>
               <span className="court-clock__label">shot clock</span>
@@ -535,6 +581,8 @@ export function Explorer({
               activeId={activeId}
               onActiveChange={setActiveId}
               onDrag={onDrag}
+              showNames={names}
+              fade={cutOpacity}
             />
           </div>
 
@@ -575,7 +623,8 @@ export function Explorer({
               aria-label={playing ? "Pause" : "Play"}
               disabled={whatIf || nFrames <= 1}
               onClick={() => {
-                if (playT >= p.decision_frame) setPlayT(0);
+                // Rewind to the top if parked at the end of the timeline.
+                if (clock >= totalMs - SNAP_EPS) setClock(0);
                 setPlaying((v) => !v);
               }}
             >
@@ -595,42 +644,73 @@ export function Explorer({
                 <input
                   type="range"
                   min={0}
-                  max={nFrames - 1}
-                  step={0.01}
-                  value={playT}
+                  max={totalMs}
+                  step={1}
+                  value={clock}
                   disabled={whatIf || nFrames <= 1}
                   onChange={(e) => {
                     setPlaying(false);
                     const raw = Number(e.target.value);
-                    // Snap affordance: clicking near a recorded marker locks to
-                    // that exact frame (exact-parity values).
-                    const nearest = Math.round(raw);
-                    setPlayT(Math.abs(raw - nearest) < 0.08 ? nearest : raw);
+                    // Snap affordance: releasing near a recorded-frame marker
+                    // locks onto that frame's dwell (exact-parity values).
+                    const snapWindow = totalMs * SCRUB_SNAP_FRAC;
+                    let nextClock = raw;
+                    for (let i = 0; i <= p.decision_frame; i++) {
+                      const ft = timeForFrame(timeline, i);
+                      if (Math.abs(raw - ft) < snapWindow) {
+                        nextClock = ft;
+                        break;
+                      }
+                    }
+                    setClock(nextClock);
                   }}
-                  aria-label="Scrub possession (continuous; snaps at recorded frames)"
+                  aria-label="Scrub possession (decision frames are held; movement between them is compressed)"
                 />
-                {/* decision-point markers — every recorded 2 Hz sample is a
-                    clickable marker; the decision frame is accented. */}
+                {/* decision-frame markers — each recorded frame in the timeline
+                    is a clickable marker placed at the START of its dwell. The
+                    decision frame is accented; a beat dot precedes each CUT. */}
                 <div className="scrub__markers" aria-hidden="true">
-                  {p.frames.map((_, i) => (
-                    <button
-                      key={i}
-                      type="button"
-                      tabIndex={-1}
-                      className={
-                        "scrub__marker" +
-                        (i === p.decision_frame ? " is-decision" : "") +
-                        (i === snapIdx && onExactFrame ? " is-current" : "")
-                      }
-                      style={{ left: `${(i / (nFrames - 1)) * 100}%` }}
-                      onClick={() => stepTo(i)}
-                      title={
-                        i === p.decision_frame
-                          ? "Decision point — click to snap"
-                          : `Frame ${i + 1} — click to snap`
-                      }
-                    />
-                  ))}
+                  {Array.from({ length: p.decision_frame + 1 }, (_, i) => {
+                    const pct =
+                      totalMs > 0
+                        ? (timeForFrame(timeline, i) / totalMs) * 100
+                        : 0;
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        tabIndex={-1}
+                        className={
+                          "scrub__marker" +
+                          (i === p.decision_frame ? " is-decision" : "") +
+                          (i === snapIdx && onExactFrame ? " is-current" : "")
+                        }
+                        style={{ left: `${pct}%` }}
+                        onClick={() => stepTo(i)}
+                        title={
+                          i === p.decision_frame
+                            ? "Decision point — click to snap"
+                            : `Frame ${i + 1} — click to snap`
+                        }
+                      />
+                    );
+                  })}
+                  {/* CUT beat markers — a faint mono dot where the play jumps
+                      (shot-clock reset / long gap) so the discontinuity reads. */}
+                  {timeline.segments
+                    .filter((s) => s.kind === "cut")
+                    .map((s) => {
+                      const mid = s.start + s.duration / 2;
+                      const pct = totalMs > 0 ? (mid / totalMs) * 100 : 0;
+                      return (
+                        <span
+                          key={`cut-${s.from}`}
+                          className="scrub__beat"
+                          style={{ left: `${pct}%` }}
+                          title="·· later in the possession"
+                        />
+                      );
+                    })}
                 </div>
               </div>
               <span className="scrub__pos">
@@ -663,6 +743,17 @@ export function Explorer({
               </span>
               What-if mode
             </label>
+            <label className="switch switch--names">
+              <input
+                type="checkbox"
+                checked={names}
+                onChange={() => setNames((v) => !v)}
+              />
+              <span className="switch__track">
+                <span className="switch__knob" />
+              </span>
+              Names
+            </label>
             {whatIf ? (
               <>
                 <button className="btn btn--sm" onClick={resetWhatIf}>
@@ -686,9 +777,11 @@ export function Explorer({
             <span className="panel__label">
               {isDecisionFrame
                 ? "Decision point"
-                : onExactFrame
-                  ? `Frame ${snapIdx + 1} — pre-decision`
-                  : "Live — between samples"}
+                : inCut
+                  ? "·· later in the possession"
+                  : onExactFrame
+                    ? `Frame ${snapIdx + 1} — held`
+                    : "Live — moving to the next moment"}
             </span>
             <div className="decision-row">
               <div>
@@ -701,8 +794,9 @@ export function Explorer({
               </div>
             </div>
             <p className="live-caption mono">
-              live agent — re-evaluated as the play moves; positions between 2 Hz
-              samples are interpolated
+              live agent — re-evaluated as the play moves; decision moments are
+              held, movement between them is compressed, and jumps in the play
+              (·· later in the possession) cut rather than glide
             </p>
             {!whatIf && agree && isDecisionFrame && (
               <p className="agree-note">

@@ -9,10 +9,20 @@ import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  buildTimeline,
+  CUT_GAP_S,
+  CUT_MS,
+  DWELL_MS,
   frameToRawState,
+  glideDurationMs,
+  GLIDE_MAX_MS,
+  GLIDE_MIN_MS,
+  GLIDE_MS_PER_S,
   interpolateFrame,
   liveFrameToRawState,
   runState,
+  timeForFrame,
+  timelineCursor,
   whatIfToRawState,
   type WhatIfState,
 } from "../engine/explorer";
@@ -160,6 +170,137 @@ describe("live interpolation glue (continuous playback)", () => {
         expect(best).toBeGreaterThanOrEqual(0);
         expect(best).toBeLessThan(5);
       }
+    }
+  });
+});
+
+describe("dwell/glide/cut timeline builder", () => {
+  it("maps a real gap to a glide duration proportional to the gap (clamped)", () => {
+    // A 2 s real gap -> 2 * GLIDE_MS_PER_S, comfortably inside the clamp.
+    expect(glideDurationMs(20, 18)).toBe(2 * GLIDE_MS_PER_S);
+    // Tiny gap clamps up to the floor; ordering is monotonic in the gap.
+    expect(glideDurationMs(20, 19.9)).toBe(GLIDE_MIN_MS);
+    expect(glideDurationMs(20, 18)).toBeGreaterThan(glideDurationMs(20, 19)!);
+    // Just under the cut threshold still glides and clamps to the ceiling.
+    expect(glideDurationMs(20, 20 - CUT_GAP_S + 0.01)).toBe(GLIDE_MAX_MS);
+  });
+
+  it("treats a shot-clock RESET (delta <= 0) as a CUT, not a glide", () => {
+    // Offensive rebound style reset 10.3 -> 24.0.
+    expect(glideDurationMs(10.3, 24.0)).toBeNull();
+    // A stall (no change) is also a discontinuity.
+    expect(glideDurationMs(12, 12)).toBeNull();
+  });
+
+  it("treats an over-long real gap (> CUT_GAP_S) as a CUT", () => {
+    expect(glideDurationMs(20, 20 - CUT_GAP_S - 0.01)).toBeNull();
+    // The exact possession from the bug report: 19.9 -> 10.3 is a 9.6 s gap.
+    expect(glideDurationMs(19.9, 10.3)).toBeNull();
+  });
+
+  it("treats a missing / non-finite clock as a CUT", () => {
+    expect(glideDurationMs(NaN, 10)).toBeNull();
+    expect(glideDurationMs(10, NaN)).toBeNull();
+    expect(glideDurationMs(Infinity, 10)).toBeNull();
+  });
+
+  it("builds dwell+glide+dwell for a clean proportional possession", () => {
+    // 0021500485 prefix style: 2.4 s gaps glide.
+    const tl = buildTimeline([15.5, 13.1, 10.7]);
+    expect(tl.segments.map((s) => s.kind)).toEqual([
+      "dwell",
+      "glide",
+      "dwell",
+      "glide",
+      "dwell",
+    ]);
+    // Each glide duration tracks its real gap.
+    const glides = tl.segments.filter((s) => s.kind === "glide");
+    expect(glides[0].duration).toBe(glideDurationMs(15.5, 13.1));
+    expect(glides[1].duration).toBe(glideDurationMs(13.1, 10.7));
+    // Segments are start-contiguous and total is their sum.
+    let acc = 0;
+    for (const s of tl.segments) {
+      expect(s.start).toBe(acc);
+      acc += s.duration;
+    }
+    expect(tl.total).toBe(acc);
+  });
+
+  it("inserts a CUT at a shot-clock reset (the 0021500207 bug case)", () => {
+    // [19.9, 10.3, 24.0, 18.5]: 9.6 s gap -> CUT, 10.3->24.0 reset -> CUT,
+    // 24.0->18.5 (5.5 s) -> glide.
+    const tl = buildTimeline([19.9, 10.3, 24.0, 18.5]);
+    expect(tl.segments.map((s) => s.kind)).toEqual([
+      "dwell",
+      "cut",
+      "dwell",
+      "cut",
+      "dwell",
+      "glide",
+      "dwell",
+    ]);
+    const cuts = tl.segments.filter((s) => s.kind === "cut");
+    expect(cuts.every((s) => s.duration === CUT_MS)).toBe(true);
+    // The cut holds its source frame and lands on the next.
+    expect(cuts[0].from).toBe(0);
+    expect(cuts[0].to).toBe(1);
+  });
+
+  it("yields a single dwell for a 1-frame possession", () => {
+    const tl = buildTimeline([15.0]);
+    expect(tl.segments).toHaveLength(1);
+    expect(tl.segments[0].kind).toBe("dwell");
+    expect(tl.total).toBe(DWELL_MS);
+    expect(tl.nFrames).toBe(1);
+    // Empty input degrades to one dwell too (defensive).
+    const empty = buildTimeline([]);
+    expect(empty.segments).toHaveLength(1);
+    expect(empty.total).toBe(DWELL_MS);
+  });
+
+  it("total duration is strictly monotonic as frames are appended", () => {
+    const clocks = [20, 18, 17.5, 24, 22, 14];
+    let prev = -1;
+    for (let n = 1; n <= clocks.length; n++) {
+      const tl = buildTimeline(clocks.slice(0, n));
+      expect(tl.total).toBeGreaterThan(prev);
+      prev = tl.total;
+    }
+  });
+
+  it("the cursor holds integer frames on dwell/cut and animates on glide", () => {
+    const tl = buildTimeline([20, 18]); // dwell, glide, dwell
+    const [d0, glide, d1] = tl.segments;
+    // mid-dwell: playT sits exactly on the integer frame.
+    expect(timelineCursor(tl, d0.start + d0.duration / 2).playT).toBe(0);
+    // mid-glide: playT is strictly between the two frames.
+    const cur = timelineCursor(tl, glide.start + glide.duration / 2);
+    expect(cur.kind).toBe("glide");
+    expect(cur.playT).toBeGreaterThan(0);
+    expect(cur.playT).toBeLessThan(1);
+    // final dwell: playT lands on the last frame.
+    expect(timelineCursor(tl, d1.start + 1).playT).toBe(1);
+    // past the end clamps to the final frame.
+    expect(timelineCursor(tl, tl.total + 999).playT).toBe(1);
+  });
+
+  it("cut cursor holds the source frame and advances dissolve progress", () => {
+    const tl = buildTimeline([19.9, 10.3]); // dwell, cut, dwell (9.6 s gap)
+    const cut = tl.segments.find((s) => s.kind === "cut")!;
+    const cur = timelineCursor(tl, cut.start + cut.duration / 2);
+    expect(cur.kind).toBe("cut");
+    expect(cur.playT).toBe(0); // no positional interpolation through the cut
+    expect(cur.cutProgress).toBeGreaterThan(0);
+    expect(cur.cutProgress).toBeLessThan(1);
+  });
+
+  it("timeForFrame maps a frame back to the start of its dwell", () => {
+    const tl = buildTimeline([20, 18, 16]);
+    for (let f = 0; f < 3; f++) {
+      const t = timeForFrame(tl, f);
+      expect(timelineCursor(tl, t).frame).toBe(f);
+      expect(timelineCursor(tl, t).playT).toBe(f);
     }
   });
 });
