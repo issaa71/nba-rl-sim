@@ -643,22 +643,6 @@ button {
   transform: translate(-50%, -50%) scale(1.15);
 }
 
-/* CUT beat — a faint mono tick where the play jumps (reset / long gap). */
-.scrub__beat {
-  position: absolute;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: 3px;
-  height: 12px;
-  border-radius: 2px;
-  background: repeating-linear-gradient(
-    var(--faint) 0 2px,
-    transparent 2px 4px
-  );
-  opacity: 0.7;
-  pointer-events: none;
-}
-
 .scrub__pos {
   font-family: var(--font-mono);
   font-size: 12px;

@@ -154,6 +154,7 @@ export default function App() {
           <Explorer
             key={selected.id}
             possession={selected}
+            tracking={data.tracking.get(selected.id) ?? null}
             data={data}
             model={model}
             onModelChange={setModel}

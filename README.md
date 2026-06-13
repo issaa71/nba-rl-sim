@@ -15,9 +15,13 @@ Live companion to the case study at
 - **Browse 40 curated possessions** from held-out test games, grouped by story:
   *Declined the shot* (the player shot; the agent saw a better pass), *Wanted the shot*
   (the player passed up a look the agent liked), and *Agreement* controls.
-- **Watch the live agent**: playback interpolates the 2 Hz tracking samples to ~30 fps and
-  re-runs the network every frame — the SHOOT/PASS call, target arrow, and Q-value bars follow
-  the play continuously. Decision-point markers stay clickable for exact stepped inspection.
+- **Watch the live agent**: playback runs in TRUE real time over the high-frequency SportVU
+  tracking (12.5 fps, ~80 ms frames, linearly interpolated between adjacent frames) — real
+  player motion and the real ball, with a subtle shot-arc when the ball rises. The agent
+  re-evaluates on the tracking frames (~4 Hz) so the SHOOT/PASS call, recommendation cue, and
+  Q-value bars follow the play continuously. At each recorded decision point the displayed
+  Q-values switch to the parity-exact stored values; those markers stay clickable for exact
+  stepped inspection.
 - **What-if mode**: pause anywhere, drag any player or defender, and the full pipeline —
   re-sort entities → zone-FG lookup → 73-feature state builder → network forward pass —
   recomputes live (~50 µs per evaluation).

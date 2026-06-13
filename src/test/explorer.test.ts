@@ -1,7 +1,10 @@
-// Integration guard for the app's engine glue (engine/explorer.ts) and the
-// what-if recompute path — the exact code the UI runs. Confirms the live path
-// reproduces the stored Dueling Q-values and that what-if recompute yields
-// finite Q-values for every action.
+// Integration guard for the app's engine glue (engine/explorer.ts +
+// engine/tracking.ts) — the exact code the UI runs. Confirms:
+//   - the recorded path reproduces the stored Dueling Q-values,
+//   - what-if recompute yields finite Q for every action,
+//   - the real-time tracking path (velocity derivation, snapshot, live state)
+//     is well-formed AND that AT a decision snap the parity-exact recorded
+//     path reproduces the stored agent_q_values for all 40 curated possessions.
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -9,32 +12,35 @@ import { dirname, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
-  buildTimeline,
-  CUT_GAP_S,
-  CUT_MS,
-  DWELL_MS,
   frameToRawState,
-  glideDurationMs,
-  GLIDE_MAX_MS,
-  GLIDE_MIN_MS,
-  GLIDE_MS_PER_S,
-  interpolateFrame,
-  liveFrameToRawState,
   runState,
-  timeForFrame,
-  timelineCursor,
   whatIfToRawState,
   type WhatIfState,
 } from "../engine/explorer";
+import {
+  deriveVelocityFeature,
+  nearestTrackFrame,
+  snapshotAt,
+  timeForTrackFrame,
+  trackSnapshotToRawState,
+  trackSpan,
+  trackXToFeature,
+  TRACK_BASKET_X,
+} from "../engine/tracking";
 import { loadNetwork, type LoadedNetwork, type WeightsFile } from "../engine/network";
-import { makeZoneFgLookup, type ZoneFgTable } from "../data/load";
-import type { PossessionsFile } from "../data/types";
+import { indexTracking, makeZoneFgLookup, type ZoneFgTable } from "../data/load";
+import { BASKET_X } from "../engine/features";
+import type { PossessionsFile, TrackingFile } from "../data/types";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const readJson = <T,>(rel: string): T =>
   JSON.parse(readFileSync(resolve(HERE, rel), "utf8")) as T;
 
 const poss = readJson<PossessionsFile>("../../public/data/possessions.json");
+const trackingFile = readJson<TrackingFile>(
+  "../../public/data/tracking_curated.json",
+);
+const tracking = indexTracking(trackingFile);
 const dueling: LoadedNetwork = loadNetwork(
   readJson<WeightsFile>("../../public/data/model_weights.dueling.json"),
 );
@@ -114,57 +120,100 @@ describe("explorer engine glue", () => {
   });
 });
 
-describe("live interpolation glue (continuous playback)", () => {
-  // A possession that has at least two recorded frames to interpolate across.
-  const p = poss.possessions.find((q) => q.frames.length >= 2)!;
+// ---------------------------------------------------------------------------
+// Real-time tracking playback
+// ---------------------------------------------------------------------------
 
-  const lookupsFor = (frameIdx: number) => {
-    const f = p.frames[frameIdx];
-    return {
-      bhFg: makeZoneFgLookup(zoneFg, f.ball_handler.compact_id),
-      tmFg: f.teammates.map((t) => makeZoneFgLookup(zoneFg, t.compact_id)),
-    };
-  };
-
-  it("at f=0 the live path tracks the recorded frame (positions + finite Q)", () => {
-    const lo = 0;
-    const a = p.frames[lo];
-    const b = p.frames[lo + 1];
-    const live = interpolateFrame(a, b, 0);
-    // f=0 must reproduce frame `a`'s ball-handler position exactly.
-    expect(live.ballHandler.x).toBeCloseTo(a.ball_handler.x, 10);
-    expect(live.ballHandler.y).toBeCloseTo(a.ball_handler.y, 10);
-    expect(live.shotClock).toBeCloseTo(a.shot_clock, 10);
-
-    const { bhFg, tmFg } = lookupsFor(lo);
-    const state = liveFrameToRawState(live, bhFg, tmFg);
-    const { q, best } = runState(dueling, state, p.entity_ids_network_order);
-    expect(q.every(Number.isFinite)).toBe(true);
-    expect(best).toBeGreaterThanOrEqual(0);
-    expect(best).toBeLessThan(5);
+describe("tracking coordinate + velocity convention", () => {
+  it("trackXToFeature reflects x about the basket axis (distance-preserving)", () => {
+    // The basket maps basket->basket: tracking basket x -> feature basket x.
+    expect(trackXToFeature(TRACK_BASKET_X)).toBeCloseTo(BASKET_X, 10);
+    // The reflection is an involution: applying it twice is identity.
+    for (const x of [0, 5.25, 10, 23.5, 47]) {
+      expect(trackXToFeature(trackXToFeature(x))).toBeCloseTo(x, 10);
+    }
   });
 
-  it("midpoint interpolation sits between the two endpoints", () => {
-    const a = p.frames[0];
-    const b = p.frames[1];
-    const mid = interpolateFrame(a, b, 0.5);
-    const lo = Math.min(a.ball_handler.x, b.ball_handler.x);
-    const hi = Math.max(a.ball_handler.x, b.ball_handler.x);
-    expect(mid.ballHandler.x).toBeGreaterThanOrEqual(lo - 1e-9);
-    expect(mid.ballHandler.x).toBeLessThanOrEqual(hi + 1e-9);
-    expect(mid.ballHandler.x).toBeCloseTo(
-      (a.ball_handler.x + b.ball_handler.x) / 2,
-      10,
-    );
+  it("velocity derivation matches the env convention v = dpos/dt (mapped to feature frame)", () => {
+    // Golden synthetic vectors: dt, a tracking prev/cur, and the EXACT expected
+    // feature-frame velocity (vx negated under the x-reflection, vy preserved).
+    const dt = 1 / 12.5; // 0.08 s
+    const cases: {
+      prev: [number, number];
+      cur: [number, number];
+      vx: number;
+      vy: number;
+    }[] = [
+      // pure +x track motion -> -x feature velocity
+      { prev: [10, 25], cur: [10 + dt * 5, 25], vx: -5, vy: 0 },
+      // pure +y track motion -> +y feature velocity (y preserved)
+      { prev: [10, 25], cur: [10, 25 + dt * 8], vx: 0, vy: 8 },
+      // diagonal
+      { prev: [20, 20], cur: [20 - dt * 3, 20 + dt * 4], vx: 3, vy: 4 },
+      // no motion
+      { prev: [30, 15], cur: [30, 15], vx: 0, vy: 0 },
+    ];
+    for (const c of cases) {
+      const v = deriveVelocityFeature(c.prev, c.cur, dt);
+      expect(v.vx).toBeCloseTo(c.vx, 9);
+      expect(v.vy).toBeCloseTo(c.vy, 9);
+    }
   });
 
-  it("yields 5 finite Q-values across the whole interpolated span (both models)", () => {
-    const { bhFg, tmFg } = lookupsFor(0);
+  it("the curated tracking has all 40 possessions", () => {
+    expect(tracking.size).toBe(40);
+  });
+});
+
+describe("real-time snapshot + live state", () => {
+  const sample = poss.possessions.find((p) => tracking.has(p.id))!;
+  const trk = tracking.get(sample.id)!;
+
+  it("snapshotAt returns 10 players each frame, clamped to the court", () => {
+    const span = trackSpan(trk);
     for (const f of [0, 0.25, 0.5, 0.75, 1]) {
-      const live = interpolateFrame(p.frames[0], p.frames[1], f);
-      const state = liveFrameToRawState(live, bhFg, tmFg);
+      const t = span.start + (span.end - span.start) * f;
+      const snap = snapshotAt(trk, t);
+      expect(snap.players.length).toBe(10);
+      for (const pl of snap.players) {
+        expect(pl.x).toBeGreaterThanOrEqual(0);
+        expect(pl.x).toBeLessThanOrEqual(47);
+        expect(pl.y).toBeGreaterThanOrEqual(0);
+        expect(pl.y).toBeLessThanOrEqual(50);
+        expect(Number.isFinite(pl.vx)).toBe(true);
+        expect(Number.isFinite(pl.vy)).toBe(true);
+      }
+    }
+  });
+
+  it("snapshotAt clamps times outside the span to the endpoints", () => {
+    const span = trackSpan(trk);
+    const before = snapshotAt(trk, span.start - 100);
+    const after = snapshotAt(trk, span.end + 100);
+    expect(before.framePos).toBe(0);
+    expect(after.framePos).toBeCloseTo(trk.frames.length - 1, 6);
+  });
+
+  it("live tracking state yields 5 finite Q-values across the span (both models)", () => {
+    const span = trackSpan(trk);
+    const bhFg = makeZoneFgLookup(
+      zoneFg,
+      sample.frames[sample.decision_frame].ball_handler.compact_id,
+    );
+    const tmFg = sample.frames[sample.decision_frame].teammates.map((t) =>
+      makeZoneFgLookup(zoneFg, t.compact_id),
+    );
+    for (const f of [0, 0.33, 0.66, 1]) {
+      const t = span.start + (span.end - span.start) * f;
+      const snap = snapshotAt(trk, t);
+      const state = trackSnapshotToRawState(
+        snap,
+        snap.shotClock ?? 14,
+        bhFg,
+        tmFg,
+      );
       for (const net of [dueling, dqn]) {
-        const { q, best } = runState(net, state, p.entity_ids_network_order);
+        const { q, best } = runState(net, state, sample.entity_ids_network_order);
         expect(q.length).toBe(5);
         expect(q.every(Number.isFinite)).toBe(true);
         expect(best).toBeGreaterThanOrEqual(0);
@@ -174,133 +223,39 @@ describe("live interpolation glue (continuous playback)", () => {
   });
 });
 
-describe("dwell/glide/cut timeline builder", () => {
-  it("maps a real gap to a glide duration proportional to the gap (clamped)", () => {
-    // A 2 s real gap -> 2 * GLIDE_MS_PER_S, comfortably inside the clamp.
-    expect(glideDurationMs(20, 18)).toBe(2 * GLIDE_MS_PER_S);
-    // Tiny gap clamps up to the floor; ordering is monotonic in the gap.
-    expect(glideDurationMs(20, 19.9)).toBe(GLIDE_MIN_MS);
-    expect(glideDurationMs(20, 18)).toBeGreaterThan(glideDurationMs(20, 19)!);
-    // Just under the cut threshold still glides and clamps to the ceiling.
-    expect(glideDurationMs(20, 20 - CUT_GAP_S + 0.01)).toBe(GLIDE_MAX_MS);
-  });
-
-  it("treats a shot-clock RESET (delta <= 0) as a CUT, not a glide", () => {
-    // Offensive rebound style reset 10.3 -> 24.0.
-    expect(glideDurationMs(10.3, 24.0)).toBeNull();
-    // A stall (no change) is also a discontinuity.
-    expect(glideDurationMs(12, 12)).toBeNull();
-  });
-
-  it("treats an over-long real gap (> CUT_GAP_S) as a CUT", () => {
-    expect(glideDurationMs(20, 20 - CUT_GAP_S - 0.01)).toBeNull();
-    // The exact possession from the bug report: 19.9 -> 10.3 is a 9.6 s gap.
-    expect(glideDurationMs(19.9, 10.3)).toBeNull();
-  });
-
-  it("treats a missing / non-finite clock as a CUT", () => {
-    expect(glideDurationMs(NaN, 10)).toBeNull();
-    expect(glideDurationMs(10, NaN)).toBeNull();
-    expect(glideDurationMs(Infinity, 10)).toBeNull();
-  });
-
-  it("builds dwell+glide+dwell for a clean proportional possession", () => {
-    // 0021500485 prefix style: 2.4 s gaps glide.
-    const tl = buildTimeline([15.5, 13.1, 10.7]);
-    expect(tl.segments.map((s) => s.kind)).toEqual([
-      "dwell",
-      "glide",
-      "dwell",
-      "glide",
-      "dwell",
-    ]);
-    // Each glide duration tracks its real gap.
-    const glides = tl.segments.filter((s) => s.kind === "glide");
-    expect(glides[0].duration).toBe(glideDurationMs(15.5, 13.1));
-    expect(glides[1].duration).toBe(glideDurationMs(13.1, 10.7));
-    // Segments are start-contiguous and total is their sum.
-    let acc = 0;
-    for (const s of tl.segments) {
-      expect(s.start).toBe(acc);
-      acc += s.duration;
+describe("snap-index parity (live Q at a snap === recorded agent_q_values)", () => {
+  it("the playhead at every decision snap lands ON that tracking frame", () => {
+    let checked = 0;
+    for (const p of poss.possessions) {
+      const trk = tracking.get(p.id);
+      if (!trk) continue;
+      const snaps = trk.decision_snap_indices;
+      // The decision-frame snap must round-trip: its frame time maps back to it.
+      for (let k = 0; k < snaps.length; k++) {
+        const t = timeForTrackFrame(trk, snaps[k]);
+        expect(nearestTrackFrame(trk, t)).toBe(snaps[k]);
+      }
+      checked++;
     }
-    expect(tl.total).toBe(acc);
+    expect(checked).toBeGreaterThanOrEqual(40);
   });
 
-  it("inserts a CUT at a shot-clock reset (the 0021500207 bug case)", () => {
-    // [19.9, 10.3, 24.0, 18.5]: 9.6 s gap -> CUT, 10.3->24.0 reset -> CUT,
-    // 24.0->18.5 (5.5 s) -> glide.
-    const tl = buildTimeline([19.9, 10.3, 24.0, 18.5]);
-    expect(tl.segments.map((s) => s.kind)).toEqual([
-      "dwell",
-      "cut",
-      "dwell",
-      "cut",
-      "dwell",
-      "glide",
-      "dwell",
-    ]);
-    const cuts = tl.segments.filter((s) => s.kind === "cut");
-    expect(cuts.every((s) => s.duration === CUT_MS)).toBe(true);
-    // The cut holds its source frame and lands on the next.
-    expect(cuts[0].from).toBe(0);
-    expect(cuts[0].to).toBe(1);
-  });
-
-  it("yields a single dwell for a 1-frame possession", () => {
-    const tl = buildTimeline([15.0]);
-    expect(tl.segments).toHaveLength(1);
-    expect(tl.segments[0].kind).toBe("dwell");
-    expect(tl.total).toBe(DWELL_MS);
-    expect(tl.nFrames).toBe(1);
-    // Empty input degrades to one dwell too (defensive).
-    const empty = buildTimeline([]);
-    expect(empty.segments).toHaveLength(1);
-    expect(empty.total).toBe(DWELL_MS);
-  });
-
-  it("total duration is strictly monotonic as frames are appended", () => {
-    const clocks = [20, 18, 17.5, 24, 22, 14];
-    let prev = -1;
-    for (let n = 1; n <= clocks.length; n++) {
-      const tl = buildTimeline(clocks.slice(0, n));
-      expect(tl.total).toBeGreaterThan(prev);
-      prev = tl.total;
+  it("recorded path at the decision snap reproduces agent_q_values for all 40 curated", () => {
+    let checked = 0;
+    let worst = 0;
+    for (const p of poss.possessions) {
+      const trk = tracking.get(p.id);
+      if (!trk) continue;
+      // At the decision snap the UI uses frameToRawState(p.frames[decision]).
+      const state = frameToRawState(p.frames[p.decision_frame]);
+      const { q, best } = runState(dueling, state, p.entity_ids_network_order);
+      for (let a = 0; a < 5; a++) {
+        worst = Math.max(worst, Math.abs(q[a] - p.agent_q_values[a]));
+      }
+      expect(best).toBe(p.agent_action);
+      checked++;
     }
-  });
-
-  it("the cursor holds integer frames on dwell/cut and animates on glide", () => {
-    const tl = buildTimeline([20, 18]); // dwell, glide, dwell
-    const [d0, glide, d1] = tl.segments;
-    // mid-dwell: playT sits exactly on the integer frame.
-    expect(timelineCursor(tl, d0.start + d0.duration / 2).playT).toBe(0);
-    // mid-glide: playT is strictly between the two frames.
-    const cur = timelineCursor(tl, glide.start + glide.duration / 2);
-    expect(cur.kind).toBe("glide");
-    expect(cur.playT).toBeGreaterThan(0);
-    expect(cur.playT).toBeLessThan(1);
-    // final dwell: playT lands on the last frame.
-    expect(timelineCursor(tl, d1.start + 1).playT).toBe(1);
-    // past the end clamps to the final frame.
-    expect(timelineCursor(tl, tl.total + 999).playT).toBe(1);
-  });
-
-  it("cut cursor holds the source frame and advances dissolve progress", () => {
-    const tl = buildTimeline([19.9, 10.3]); // dwell, cut, dwell (9.6 s gap)
-    const cut = tl.segments.find((s) => s.kind === "cut")!;
-    const cur = timelineCursor(tl, cut.start + cut.duration / 2);
-    expect(cur.kind).toBe("cut");
-    expect(cur.playT).toBe(0); // no positional interpolation through the cut
-    expect(cur.cutProgress).toBeGreaterThan(0);
-    expect(cur.cutProgress).toBeLessThan(1);
-  });
-
-  it("timeForFrame maps a frame back to the start of its dwell", () => {
-    const tl = buildTimeline([20, 18, 16]);
-    for (let f = 0; f < 3; f++) {
-      const t = timeForFrame(tl, f);
-      expect(timelineCursor(tl, t).frame).toBe(f);
-      expect(timelineCursor(tl, t).playT).toBe(f);
-    }
+    expect(checked).toBeGreaterThanOrEqual(40);
+    expect(worst).toBeLessThanOrEqual(1e-4);
   });
 });

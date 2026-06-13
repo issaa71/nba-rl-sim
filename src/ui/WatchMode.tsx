@@ -11,8 +11,16 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { AppData } from "../data/load";
-import { buildWatchRotation, loadStreamPossessions } from "../data/load";
-import { actionLabel, type Possession } from "../data/types";
+import {
+  buildWatchRotation,
+  loadStreamPossessions,
+  loadStreamTracking,
+} from "../data/load";
+import {
+  actionLabel,
+  type Possession,
+  type TrackingPossession,
+} from "../data/types";
 import { Explorer } from "./Explorer";
 import { ModelToggle } from "./bits";
 import { outcomeText, type ModelMode } from "./model";
@@ -36,13 +44,15 @@ export function WatchMode({
   onExit,
 }: WatchModeProps) {
   const [stream, setStream] = useState<Possession[] | null>(null);
+  const [streamTracking, setStreamTracking] =
+    useState<Map<string, TrackingPossession> | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [index, setIndex] = useState(0);
   const [phase, setPhase] = useState<Phase>("playing");
   const [paused, setPaused] = useState(false);
 
-  // Lazy-load the stream possessions ONLY when watch mode mounts. The landing /
-  // browser view never imports this payload.
+  // Lazy-load the stream possessions + their tracking ONLY when watch mode
+  // mounts. The landing / browser / explorer views never import these payloads.
   useEffect(() => {
     let alive = true;
     loadStreamPossessions()
@@ -52,6 +62,11 @@ export function WatchMode({
       .catch((e: unknown) => {
         if (alive) setLoadError(e instanceof Error ? e.message : String(e));
       });
+    // Tracking is best-effort: a failure just degrades those possessions to the
+    // stepped fallback view (loadStreamTracking resolves to an empty map).
+    loadStreamTracking().then((t) => {
+      if (alive) setStreamTracking(t);
+    });
     return () => {
       alive = false;
     };
@@ -65,6 +80,15 @@ export function WatchMode({
 
   const current = rotation ? rotation[index] : null;
 
+  // Tracking for the current possession: curated set first, then the lazily
+  // loaded stream tracking. Null -> Explorer falls back to the stepped view.
+  const currentTracking = useMemo(() => {
+    if (!current) return null;
+    return (
+      data.tracking.get(current.id) ?? streamTracking?.get(current.id) ?? null
+    );
+  }, [current, data.tracking, streamTracking]);
+
   const advance = useCallback(() => {
     setPhase("playing");
     setIndex((i) => {
@@ -73,15 +97,17 @@ export function WatchMode({
     });
   }, [rotation]);
 
-  // Auto-advance after the interstitial lingers. The timer is held while paused
-  // (it restarts from full on resume — the linger is short enough that this
-  // reads naturally) and cleared on skip/unmount.
+  // Auto-advance after the interstitial lingers. The interstitial appears AT
+  // the final decision and the outcome flight keeps playing underneath it for
+  // ~INTERSTITIAL_MS before we advance. The timer is held while paused (it
+  // restarts from full on resume) and cleared on skip/unmount.
   useEffect(() => {
     if (phase !== "interstitial" || paused) return;
     const t = window.setTimeout(advance, INTERSTITIAL_MS);
     return () => window.clearTimeout(t);
   }, [phase, paused, index, advance]);
 
+  // Fired by the Explorer when playback first crosses the FINAL decision moment.
   const onReachedDecision = useCallback(() => {
     setPhase("interstitial");
   }, []);
@@ -145,12 +171,16 @@ export function WatchMode({
       <Explorer
         key={current.id}
         possession={current}
+        tracking={currentTracking}
         data={data}
         model={model}
         onModelChange={onModelChange}
         onBack={onExit}
         autoPlay
-        paused={paused || showInterstitial}
+        // Only the user's explicit pause freezes playback. The interstitial does
+        // NOT pause — the outcome flight (the post-decision tracking frames)
+        // keeps playing underneath the reveal for ~1.5 s before we advance.
+        paused={paused}
         onReachedDecision={onReachedDecision}
         topSlot={
           <WatchBar

@@ -22,13 +22,18 @@ export interface CourtArrow {
   fromY: number;
   toX: number;
   toY: number;
-  /** "pass" = emerald solid; "shoot" = emerald toward basket dashed. */
+  /** "pass" = soft curved cue to a teammate; "shoot" = subtle cue at the rim. */
   kind: "pass" | "shoot";
 }
 
 interface CourtProps {
   entities: CourtEntity[];
   ball: { x: number; y: number };
+  /**
+   * Ball height (ft). When it rises above a threshold the ball renders as a
+   * subtle in-flight arc (shot/pass), instead of the resting offset dot.
+   */
+  ballZ?: number;
   arrow: CourtArrow | null;
   /** drag enabled (what-if mode). */
   draggable: boolean;
@@ -39,7 +44,7 @@ interface CourtProps {
   onDrag?: (id: string, x: number, y: number) => void;
   /** always-on compact name labels under offense dots (defaults on). */
   showNames?: boolean;
-  /** court opacity 0..1 — dipped during a playback CUT for the dissolve. */
+  /** court opacity 0..1 (kept for transitional fades). */
   fade?: number;
 }
 
@@ -157,6 +162,18 @@ function drawCourt(ctx: CanvasRenderingContext2D, w: number, h: number) {
   ctx.stroke();
 }
 
+/**
+ * Restrained recommendation cue. Replaces the old full-length straight arrow
+ * (which read as an absurd diagram line). Two restrained forms:
+ *
+ *   PASS  — a soft, low-opacity QUADRATIC curve bowing from the ball-handler
+ *           toward the target teammate, stopping short of the dot, plus a small
+ *           accent ring + connecting tick on the target. No big arrowhead.
+ *   SHOOT — no long line; just a short tick off the ball-handler toward the
+ *           basket and a soft accent ring on the rim, so the call reads subtly.
+ *
+ * Everything is scaled down and translucent so it informs without dominating.
+ */
 function drawArrow(ctx: CanvasRenderingContext2D, a: CourtArrow, w: number, h: number) {
   const from = toPx(a.fromX, a.fromY, w, h);
   const to = toPx(a.toX, a.toY, w, h);
@@ -165,35 +182,63 @@ function drawArrow(ctx: CanvasRenderingContext2D, a: CourtArrow, w: number, h: n
   const len = Math.hypot(dx, dy) || 1;
   const ux = dx / len;
   const uy = dy / len;
-  // shorten so the head sits before the target dot
-  const gap = 16;
-  const ex = to.px - ux * gap;
-  const ey = to.py - uy * gap;
-  const sx = from.px + ux * 16;
-  const sy = from.py + uy * 16;
 
-  ctx.strokeStyle = COL.arrow;
-  ctx.fillStyle = COL.arrow;
-  ctx.lineWidth = 2.5;
+  ctx.save();
   ctx.lineCap = "round";
-  if (a.kind === "shoot") ctx.setLineDash([7, 6]);
-  else ctx.setLineDash([]);
+  ctx.lineJoin = "round";
 
+  if (a.kind === "shoot") {
+    // Subtle "shoot" cue: a short tick off the BH toward the rim + a soft ring
+    // on the basket. No long line crossing the court.
+    const tick = Math.min(22, len * 0.5);
+    const sx = from.px + ux * 15;
+    const sy = from.py + uy * 15;
+    ctx.strokeStyle = "rgba(4,120,87,0.45)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + ux * tick, sy + uy * tick);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // soft accent ring on the rim
+    ctx.strokeStyle = "rgba(4,120,87,0.55)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(to.px - 6, to.py, 11, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  // PASS cue: a soft quadratic curve bowing toward the target, stopping short
+  // of the target dot; a connecting tick + accent ring sits on the teammate.
+  const startGap = 15;
+  const endGap = 18;
+  const sx = from.px + ux * startGap;
+  const sy = from.py + uy * startGap;
+  const ex = to.px - ux * endGap;
+  const ey = to.py - uy * endGap;
+  // Perpendicular bow, proportional to length (gentle, capped).
+  const bow = Math.min(26, len * 0.16);
+  const mx = (sx + ex) / 2 - uy * bow;
+  const my = (sy + ey) / 2 + ux * bow;
+
+  ctx.strokeStyle = "rgba(4,120,87,0.32)";
+  ctx.lineWidth = 2.25;
   ctx.beginPath();
   ctx.moveTo(sx, sy);
-  ctx.lineTo(ex, ey);
+  ctx.quadraticCurveTo(mx, my, ex, ey);
   ctx.stroke();
-  ctx.setLineDash([]);
 
-  // arrowhead
-  const head = 9;
-  const ang = Math.atan2(uy, ux);
+  // accent ring on the target teammate
+  ctx.strokeStyle = "rgba(4,120,87,0.6)";
+  ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(ex, ey);
-  ctx.lineTo(ex - head * Math.cos(ang - 0.42), ey - head * Math.sin(ang - 0.42));
-  ctx.lineTo(ex - head * Math.cos(ang + 0.42), ey - head * Math.sin(ang + 0.42));
-  ctx.closePath();
-  ctx.fill();
+  ctx.arc(to.px, to.py, 13.5, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.restore();
 }
 
 /** Compact label: last name for offense (the user's "player numbers"). */
@@ -235,6 +280,7 @@ function drawEntities(
   ctx: CanvasRenderingContext2D,
   entities: CourtEntity[],
   ball: { x: number; y: number },
+  ballZ: number,
   activeId: string | null,
   showNames: boolean,
   w: number,
@@ -305,15 +351,44 @@ function drawEntities(
     }
   }
 
-  // ball — co-located with BH; render as a small accented dot offset slightly
+  // ball — the REAL tracked ball. At rest (low z) it sits as a small accented
+  // dot just off the handler. As the ball rises (a shot or a lob pass) we lift
+  // it visually: a soft shadow stays on the floor and the ball floats up with a
+  // faint trailing arc, so the shot reads without a literal parabola overlay.
   const bp = toPx(ball.x, ball.y, w, h);
-  ctx.beginPath();
-  ctx.arc(bp.px + 9, bp.py - 9, 4.5, 0, Math.PI * 2);
-  ctx.fillStyle = COL.ball;
-  ctx.fill();
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = "#a85d05";
-  ctx.stroke();
+  const REST_Z = 4; // ~dribble/hold height (ft); above this reads as "in flight"
+  const lift = ballZ > REST_Z ? Math.min(1, (ballZ - REST_Z) / 7) : 0; // 0..1
+  if (lift > 0) {
+    // floor shadow (where the ball is, on the wood)
+    ctx.beginPath();
+    ctx.ellipse(bp.px, bp.py, 5 - lift * 1.5, 2.6 - lift, 0, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(40,32,20,0.18)";
+    ctx.fill();
+    // raised ball: lift it upward (toward top of canvas) proportional to height
+    const ry = bp.py - lift * 26;
+    // faint trailing arc from the floor up to the ball
+    ctx.beginPath();
+    ctx.moveTo(bp.px, bp.py);
+    ctx.quadraticCurveTo(bp.px - 4, (bp.py + ry) / 2, bp.px, ry);
+    ctx.strokeStyle = "rgba(217,119,6,0.28)";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(bp.px, ry, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = COL.ball;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#a85d05";
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.arc(bp.px + 9, bp.py - 9, 4.5, 0, Math.PI * 2);
+    ctx.fillStyle = COL.ball;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "#a85d05";
+    ctx.stroke();
+  }
 }
 
 function roundRect(
@@ -336,6 +411,7 @@ function roundRect(
 export function Court({
   entities,
   ball,
+  ballZ = 0,
   arrow,
   draggable,
   activeId,
@@ -361,13 +437,12 @@ export function Court({
     ctx.save();
     ctx.scale(dpr, dpr);
     drawCourt(ctx, CANVAS_W, CANVAS_H);
-    // CUT dissolve: the court (arrow + entities) fades over the held frame; the
-    // wood backdrop stays so the dip reads as a dissolve, not a blackout.
+    // Optional transitional fade over the play layer; the wood backdrop stays.
     ctx.globalAlpha = Math.max(0, Math.min(1, fade));
     if (arrow) drawArrow(ctx, arrow, CANVAS_W, CANVAS_H);
-    drawEntities(ctx, entities, ball, activeId, showNames, CANVAS_W, CANVAS_H);
+    drawEntities(ctx, entities, ball, ballZ, activeId, showNames, CANVAS_W, CANVAS_H);
     ctx.restore();
-  }, [entities, ball, arrow, activeId, showNames, fade]);
+  }, [entities, ball, ballZ, arrow, activeId, showNames, fade]);
 
   const eventToCanvas = useCallback((clientX: number, clientY: number) => {
     const canvas = canvasRef.current!;

@@ -115,6 +115,58 @@ export interface PlayersFile {
 }
 
 // ---------------------------------------------------------------------------
+// High-frequency tracking (real SportVU motion) — public/data/tracking_*.json.
+//
+// Authoritative spec: the export `note`. Positions are in the env half-court
+// frame but with the BASKET ON THE LEFT at (5.25, 25); x in [0, 47], y in
+// [0, 50]. (The feature/possessions frame puts the basket on the RIGHT at
+// x = 47 — engine/tracking.ts holds the exact transform.) `players` are 10
+// entities in NETWORK order [ball_handler, tm1..4, def1..5]; `ball` is
+// [x, y, z] (z drives the shot-arc render). `decision_snap_indices[k]` is the
+// tracking-frame index nearest the k-th recorded decision point — the index at
+// which playback defers to the parity-exact recorded path.
+// ---------------------------------------------------------------------------
+
+/** One tracking frame: real positions + clocks + real ball with height. */
+export interface TrackingFrame {
+  /** wall-time offset (s) from the span start. */
+  t: number;
+  /** shot clock (s); may be null when the source clock is missing. */
+  sc: number | null;
+  /** game clock (s); may be null. */
+  gc: number | null;
+  /** quarter; may be null. */
+  q: number | null;
+  /** 10 entities [BH, tm1..4, def1..5], each [x, y] in the tracking frame. */
+  players: [number, number][];
+  /** real ball [x, y, z] (z for shot-arc rendering). */
+  ball: [number, number, number];
+}
+
+export interface TrackingPossession {
+  id: string;
+  game_id: string;
+  fps: number;
+  n_frames: number;
+  /** original game orientation (positions are already basket-relative). */
+  attacking_right: boolean;
+  /** tracking-frame index of each recorded decision point, ascending. */
+  decision_snap_indices: number[];
+  frames: TrackingFrame[];
+}
+
+export interface TrackingFile {
+  note: string;
+  fps: number;
+  frame_player_order: string[];
+  ball_format: string;
+  court_frame: string;
+  category: "curated" | "stream";
+  n_possessions: number;
+  possessions: TrackingPossession[];
+}
+
+// ---------------------------------------------------------------------------
 // Action labels
 // ---------------------------------------------------------------------------
 
