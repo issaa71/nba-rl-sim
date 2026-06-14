@@ -864,6 +864,10 @@ button {
 }
 
 .switch {
+  /* positioning context for the absolutely-sized hidden <input> below — without
+     it the 100%x100% input escapes to the nearest positioned ancestor and
+     overlays the transport row, stealing the Play button's clicks (~1440px). */
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 9px;
