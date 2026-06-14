@@ -376,3 +376,129 @@ export function nearestTrackFrame(poss: TrackingPossession, time: number): numbe
   }
   return best;
 }
+
+// ===========================================================================
+// FULL-COURT RENDER PATH (additive — does NOT touch the feature/agent path).
+//
+// The renderer consumes RAW SportVU coordinates (x in [0,94], BOTH baskets,
+// real per-possession orientation) from tracking_*_fullcourt.json, while the
+// live agent keeps consuming the half-court feature snapshot above, UNCHANGED.
+// The two frames are related by `foldRawToFeature`, which is clip-free — and
+// exactly equal to the half-court export (verified to rounding) — in the
+// frontcourt; what-if drag uses it to map a dragged full-court position back
+// into the agent's feature frame.
+// ===========================================================================
+
+/** Raw full-court bounds — must match Court.tsx full-court COURT_X_FULL/COURT_Y. */
+const RAW_X_MAX = 94;
+const RAW_Y_MAX = 50;
+// x-offset of the right-attacking fold: feature_x = rawX - (94 - X_REFLECT).
+const FOLD_RIGHT_DX = RAW_X_MAX - X_REFLECT; // 41.75
+
+/**
+ * Fold a RAW full-court position into the basket-right feature frame
+ * ([0,47] x [0,50]), clamped. In the frontcourt this reproduces the half-court
+ * export EXACTLY (verified, |delta| <= rounding); in the backcourt it clamps
+ * like the export's clip. `attackingRight` is the possession's real orientation:
+ *   true  -> offense attacks the RIGHT raw basket (88.75,25)
+ *   false -> offense attacks the LEFT  raw basket (5.25,25)
+ */
+export function foldRawToFeature(
+  x: number,
+  y: number,
+  attackingRight: boolean,
+): { x: number; y: number } {
+  const fx = attackingRight ? x - FOLD_RIGHT_DX : X_REFLECT - x;
+  const fy = attackingRight ? RAW_Y_MAX - y : y;
+  return { x: clamp(fx, 0, RENDER_X_MAX), y: clamp(fy, 0, RENDER_Y_MAX) };
+}
+
+/** A render-only snapshot in RAW full-court coordinates (no velocity, no fold). */
+export interface RawTrackSnapshot {
+  /** 10 entities [BH, tm1..4, def1..5], raw [x,y] in [0,94] x [0,50]. */
+  players: { x: number; y: number }[];
+  /** ball [x,y] raw. */
+  ball: { x: number; y: number };
+  ballZ: number;
+  shotClock: number | null;
+  framePos: number;
+}
+
+/**
+ * Resolve the playback head at wall-time `time` (s) to a RAW full-court render
+ * snapshot. Same wall-clock interpolation + teleport guard as `snapshotAt`, but
+ * NO feature fold and NO velocity (render only). Positions clamp to the raw
+ * court so out-of-bounds tracking never streaks off-canvas.
+ */
+export function rawSnapshotAt(
+  poss: TrackingPossession,
+  time: number,
+): RawTrackSnapshot {
+  const frames = poss.frames;
+  const n = frames.length;
+  if (n === 0) {
+    return { players: [], ball: { x: 0, y: 0 }, ballZ: 0, shotClock: null, framePos: 0 };
+  }
+  if (n === 1) return rawFrameSnapshot(poss, 0, 0);
+
+  const clampedT = clamp(time, frames[0].t, frames[n - 1].t);
+  let lo = 0;
+  for (let i = 1; i < n; i++) {
+    if (frames[i].t <= clampedT) lo = i;
+    else break;
+  }
+  const hi = Math.min(n - 1, lo + 1);
+  const span = frames[hi].t - frames[lo].t;
+  const f = span > 0 ? clamp((clampedT - frames[lo].t) / span, 0, 1) : 0;
+  return rawInterpolatedSnapshot(poss, lo, hi, f);
+}
+
+function rawFrameSnapshot(
+  poss: TrackingPossession,
+  i: number,
+  frameFractionBias: number,
+): RawTrackSnapshot {
+  const fr = poss.frames[i];
+  return {
+    players: fr.players.map((p) => ({
+      x: clamp(p[0], 0, RAW_X_MAX),
+      y: clamp(p[1], 0, RAW_Y_MAX),
+    })),
+    ball: { x: clamp(fr.ball[0], 0, RAW_X_MAX), y: clamp(fr.ball[1], 0, RAW_Y_MAX) },
+    ballZ: fr.ball[2],
+    shotClock: fr.sc,
+    framePos: i + frameFractionBias,
+  };
+}
+
+function rawInterpolatedSnapshot(
+  poss: TrackingPossession,
+  lo: number,
+  hi: number,
+  f: number,
+): RawTrackSnapshot {
+  const a = poss.frames[lo];
+  const b = poss.frames[hi];
+  const players = a.players.map((pa, k) => {
+    const pb = b.players[k] ?? pa;
+    // teleport glitch: hold `a` then jump to `b` rather than streak the court.
+    const px = isTeleport(pa, pb) ? (f < 0.5 ? pa[0] : pb[0]) : lerp(pa[0], pb[0], f);
+    const py = isTeleport(pa, pb) ? (f < 0.5 ? pa[1] : pb[1]) : lerp(pa[1], pb[1], f);
+    return { x: clamp(px, 0, RAW_X_MAX), y: clamp(py, 0, RAW_Y_MAX) };
+  });
+  const ballA: [number, number] = [a.ball[0], a.ball[1]];
+  const ballB: [number, number] = [b.ball[0], b.ball[1]];
+  const ballSnap = isTeleport(ballA, ballB);
+  const pick = (ai: number, bi: number, lerped: number) =>
+    ballSnap ? (f < 0.5 ? ai : bi) : lerped;
+  return {
+    players,
+    ball: {
+      x: clamp(pick(a.ball[0], b.ball[0], lerp(a.ball[0], b.ball[0], f)), 0, RAW_X_MAX),
+      y: clamp(pick(a.ball[1], b.ball[1], lerp(a.ball[1], b.ball[1], f)), 0, RAW_Y_MAX),
+    },
+    ballZ: pick(a.ball[2], b.ball[2], lerp(a.ball[2], b.ball[2], f)),
+    shotClock: a.sc != null && b.sc != null ? lerp(a.sc, b.sc, f) : (a.sc ?? b.sc),
+    framePos: lo + f,
+  };
+}

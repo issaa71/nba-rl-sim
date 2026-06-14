@@ -15,6 +15,7 @@ import {
   buildWatchRotation,
   loadStreamPossessions,
   loadStreamTracking,
+  loadStreamTrackingFc,
 } from "../data/load";
 import {
   actionLabel,
@@ -46,6 +47,8 @@ export function WatchMode({
   const [stream, setStream] = useState<Possession[] | null>(null);
   const [streamTracking, setStreamTracking] =
     useState<Map<string, TrackingPossession> | null>(null);
+  const [streamTrackingFc, setStreamTrackingFc] =
+    useState<Map<string, TrackingPossession> | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [index, setIndex] = useState(0);
   const [phase, setPhase] = useState<Phase>("playing");
@@ -63,9 +66,13 @@ export function WatchMode({
         if (alive) setLoadError(e instanceof Error ? e.message : String(e));
       });
     // Tracking is best-effort: a failure just degrades those possessions to the
-    // stepped fallback view (loadStreamTracking resolves to an empty map).
+    // stepped fallback view (loadStreamTracking resolves to an empty map). The
+    // full-court twin drives the render; absent -> half-court render fallback.
     loadStreamTracking().then((t) => {
       if (alive) setStreamTracking(t);
+    });
+    loadStreamTrackingFc().then((t) => {
+      if (alive) setStreamTrackingFc(t);
     });
     return () => {
       alive = false;
@@ -88,6 +95,14 @@ export function WatchMode({
       data.tracking.get(current.id) ?? streamTracking?.get(current.id) ?? null
     );
   }, [current, data.tracking, streamTracking]);
+
+  // Full-court render twin for the current possession (curated then stream).
+  const currentTrackingFc = useMemo(() => {
+    if (!current) return null;
+    return (
+      data.trackingFc.get(current.id) ?? streamTrackingFc?.get(current.id) ?? null
+    );
+  }, [current, data.trackingFc, streamTrackingFc]);
 
   const advance = useCallback(() => {
     setPhase("playing");
@@ -172,6 +187,7 @@ export function WatchMode({
         key={current.id}
         possession={current}
         tracking={currentTracking}
+        trackingFc={currentTrackingFc}
         data={data}
         model={model}
         onModelChange={onModelChange}

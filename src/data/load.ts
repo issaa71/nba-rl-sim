@@ -36,8 +36,19 @@ export interface AppData {
    * Loaded upfront alongside the explorer payloads (it drives the headline
    * real-time playback). A possession with NO entry falls back to the old
    * stepped, low-rate view.
+   *
+   * These positions are in the HALF-COURT feature frame — they drive the live
+   * agent (engine/tracking.ts) and must stay exactly as the parity path expects.
    */
   tracking: Map<string, TrackingPossession>;
+  /**
+   * The SAME curated tracking in RAW FULL-COURT coordinates (x in [0,94], both
+   * baskets), frame-for-frame aligned with `tracking`. Drives the full-court
+   * RENDER only; the agent never reads these (it folds back via the half-court
+   * `tracking`). Empty map if the full-court file is absent (render falls back
+   * to the half-court view).
+   */
+  trackingFc: Map<string, TrackingPossession>;
 }
 
 export interface ZoneFgTable {
@@ -52,19 +63,31 @@ interface ZoneFgFile {
 }
 
 export async function loadAppData(): Promise<AppData> {
-  const [possessions, players, duelingFile, dqnFile, zoneFgFile, trackingFile] =
-    await Promise.all([
-      getJson<PossessionsFile>("possessions.json"),
-      getJson<PlayersFile>("players.json"),
-      getJson<WeightsFile>("model_weights.dueling.json"),
-      getJson<WeightsFile>("model_weights.dqn.json"),
-      getJson<ZoneFgFile>("zone_fg.json"),
-      // Curated tracking ships with the explorer — it IS the headline playback.
-      // If it 404s the explorer still works via the stepped fallback view.
-      getJson<TrackingFile>("tracking_curated.json").catch(
-        () => null as TrackingFile | null,
-      ),
-    ]);
+  const [
+    possessions,
+    players,
+    duelingFile,
+    dqnFile,
+    zoneFgFile,
+    trackingFile,
+    trackingFcFile,
+  ] = await Promise.all([
+    getJson<PossessionsFile>("possessions.json"),
+    getJson<PlayersFile>("players.json"),
+    getJson<WeightsFile>("model_weights.dueling.json"),
+    getJson<WeightsFile>("model_weights.dqn.json"),
+    getJson<ZoneFgFile>("zone_fg.json"),
+    // Curated tracking ships with the explorer — it IS the headline playback.
+    // If it 404s the explorer still works via the stepped fallback view.
+    getJson<TrackingFile>("tracking_curated.json").catch(
+      () => null as TrackingFile | null,
+    ),
+    // Full-court render coords (same possessions, raw 0-94). If absent the
+    // explorer renders the half-court view from `tracking` instead.
+    getJson<TrackingFile>("tracking_curated_fullcourt.json").catch(
+      () => null as TrackingFile | null,
+    ),
+  ]);
 
   return {
     possessions,
@@ -76,6 +99,7 @@ export async function loadAppData(): Promise<AppData> {
       leagueAvg: zoneFgFile.special_entries.__league_avg__,
     },
     tracking: indexTracking(trackingFile),
+    trackingFc: indexTracking(trackingFcFile),
   };
 }
 
@@ -173,6 +197,29 @@ export function loadStreamTracking(): Promise<Map<string, TrackingPossession>> {
       });
   }
   return streamTrackingPromise;
+}
+
+let streamTrackingFcPromise: Promise<Map<string, TrackingPossession>> | null =
+  null;
+
+/**
+ * Lazily fetch the stream tracking in RAW FULL-COURT coords (the render twin of
+ * loadStreamTracking). Same memoization + best-effort fallback (empty map ->
+ * those possessions render the half-court view). Fetched ONLY when watch mode
+ * asks for it.
+ */
+export function loadStreamTrackingFc(): Promise<Map<string, TrackingPossession>> {
+  if (!streamTrackingFcPromise) {
+    streamTrackingFcPromise = getJson<TrackingFile>(
+      "tracking_stream_fullcourt.json",
+    )
+      .then(indexTracking)
+      .catch(() => {
+        streamTrackingFcPromise = null;
+        return new Map<string, TrackingPossession>();
+      });
+  }
+  return streamTrackingFcPromise;
 }
 
 /**

@@ -35,14 +35,18 @@ import {
   playerChoice,
   runState,
   whatIfToRawState,
+  type QResult,
   type WhatIfState,
 } from "../engine/explorer";
 import {
+  foldRawToFeature,
   nearestTrackFrame,
+  rawSnapshotAt,
   snapshotAt,
   timeForTrackFrame,
   trackSnapshotToRawState,
   trackSpan,
+  type RawTrackSnapshot,
   type TrackSnapshot,
 } from "../engine/tracking";
 import { BASKET_X, BASKET_Y } from "../engine/features";
@@ -55,6 +59,16 @@ import { ModelToggle } from "./bits";
 import { MODEL_LABELS, outcomeText, type ModelMode } from "./model";
 
 const SPEEDS = [0.5, 1, 2] as const;
+
+// Half-court line in the RAW full-court frame (ft). The frontcourt gate: the
+// live agent only evaluates once the ball-handler crosses into the offense's
+// attacking half (mirrors the original app.py:422-426 build_state gate).
+const HALF_COURT_X = 47;
+// Raw full-court basket positions (ft) for the "shoot" cue target.
+const RAW_BASKET_RIGHT = { x: 88.75, y: 25 };
+const RAW_BASKET_LEFT = { x: 5.25, y: 25 };
+// Neutral Q result shown before the agent's first frontcourt evaluation.
+const NEUTRAL_RESULT = { q: [0, 0, 0, 0, 0], best: -1 };
 
 // Live-agent evaluation cadence between decision snaps (Hz). The live state is
 // recomputed when the playback clock crosses one of these buckets — and always
@@ -78,6 +92,11 @@ interface ExplorerProps {
   possession: Possession;
   /** Real high-frequency tracking for this possession, if available. */
   tracking?: TrackingPossession | null;
+  /**
+   * The SAME tracking in RAW full-court coordinates (drives the full-court
+   * render). Null/absent -> the explorer renders the half-court view.
+   */
+  trackingFc?: TrackingPossession | null;
   data: AppData;
   model: ModelMode;
   onModelChange: (m: ModelMode) => void;
@@ -118,6 +137,7 @@ function firstName(full: string): string | undefined {
 export function Explorer({
   possession: p,
   tracking,
+  trackingFc,
   data,
   model,
   onModelChange,
@@ -136,6 +156,7 @@ export function Explorer({
       <TrackedExplorer
         p={p}
         tracking={tracking}
+        trackingFc={trackingFc ?? null}
         data={data}
         model={model}
         onModelChange={onModelChange}
@@ -168,6 +189,7 @@ export function Explorer({
 interface TrackedProps {
   p: Possession;
   tracking: TrackingPossession;
+  trackingFc: TrackingPossession | null;
   data: AppData;
   model: ModelMode;
   onModelChange: (m: ModelMode) => void;
@@ -181,6 +203,7 @@ interface TrackedProps {
 function TrackedExplorer({
   p,
   tracking,
+  trackingFc,
   data,
   model,
   onModelChange,
@@ -257,30 +280,63 @@ function TrackedExplorer({
     [tracking, clock],
   );
 
-  // Snapshot the draggable positions for the current tracking frame.
+  // --- full-court render twin (raw coords). The agent NEVER reads this; it
+  // folds render positions back to the feature frame via `toFeature`. Null ->
+  // render the half-court view from the feature `snapshot` (fallback). ---
+  const fullCourt = !!trackingFc && trackingFc.frames.length >= 2;
+  const attackingRight = trackingFc?.attacking_right ?? true;
+  const rawSnap: RawTrackSnapshot | null = useMemo(
+    () => (fullCourt && trackingFc ? rawSnapshotAt(trackingFc, clock) : null),
+    [fullCourt, trackingFc, clock],
+  );
+  // Positions handed to the renderer: raw full-court when available, else the
+  // half-court feature positions.
+  const renderPlayers: { x: number; y: number }[] = useMemo(
+    () => (rawSnap ? rawSnap.players : snapshot.players.map((q) => ({ x: q.x, y: q.y }))),
+    [rawSnap, snapshot],
+  );
+  // Map a RENDER position back to the agent's feature frame (identity off the
+  // full-court path; the verified fold on it).
+  const toFeature = useCallback(
+    (x: number, y: number) =>
+      fullCourt ? foldRawToFeature(x, y, attackingRight) : { x, y },
+    [fullCourt, attackingRight],
+  );
+  // Frontcourt gate: the live agent only evaluates once the ball-handler is in
+  // the offense's attacking half (raw frame). Always true off the full-court
+  // path (the feature frame is already canonical frontcourt).
+  const bhInFrontcourt = useMemo(() => {
+    if (!fullCourt) return true;
+    const bx = renderPlayers[0]?.x ?? HALF_COURT_X;
+    return attackingRight ? bx >= HALF_COURT_X : bx <= HALF_COURT_X;
+  }, [fullCourt, renderPlayers, attackingRight]);
+
+  // Snapshot the draggable positions for the current frame: RENDER positions
+  // (raw when full-court) carry the displayed coords; velocities come from the
+  // feature snapshot (frame-consistent; unchanged by a static drag).
   const snapshotForWhatIf = useCallback(
-    (snap: TrackSnapshot): WhatIfState => ({
+    (): WhatIfState => ({
       ballHandler: {
-        x: snap.players[0]?.x ?? 0,
-        y: snap.players[0]?.y ?? 0,
-        vx: snap.players[0]?.vx ?? 0,
-        vy: snap.players[0]?.vy ?? 0,
+        x: renderPlayers[0]?.x ?? 0,
+        y: renderPlayers[0]?.y ?? 0,
+        vx: snapshot.players[0]?.vx ?? 0,
+        vy: snapshot.players[0]?.vy ?? 0,
       },
-      teammates: snap.players.slice(1, 5).map((t) => ({
+      teammates: renderPlayers.slice(1, 5).map((t, i) => ({
         x: t.x,
         y: t.y,
-        vx: t.vx,
-        vy: t.vy,
+        vx: snapshot.players[1 + i]?.vx ?? 0,
+        vy: snapshot.players[1 + i]?.vy ?? 0,
         zone_fg_pct: 0, // recomputed via the per-teammate FG lookup
       })),
-      defenders: snap.players.slice(5, 10).map((d) => ({
+      defenders: renderPlayers.slice(5, 10).map((d, i) => ({
         x: d.x,
         y: d.y,
-        vx: d.vx,
-        vy: d.vy,
+        vx: snapshot.players[5 + i]?.vx ?? 0,
+        vy: snapshot.players[5 + i]?.vy ?? 0,
       })),
     }),
-    [],
+    [renderPlayers, snapshot],
   );
 
   // --- real-time playback loop. Advances the wall-clock by elapsed * speed.
@@ -328,10 +384,10 @@ function TrackedExplorer({
   }, [autoPlay, whatIf, clock, decisionTime, onReachedDecision]);
 
   const enterWhatIf = useCallback(() => {
-    setWiState(snapshotForWhatIf(snapshot));
+    setWiState(snapshotForWhatIf());
     setWhatIf(true);
     setPlaying(false);
-  }, [snapshot, snapshotForWhatIf]);
+  }, [snapshotForWhatIf]);
 
   const toggleWhatIf = useCallback(() => {
     if (whatIf) {
@@ -343,8 +399,8 @@ function TrackedExplorer({
   }, [whatIf, enterWhatIf]);
 
   const resetWhatIf = useCallback(() => {
-    setWiState(snapshotForWhatIf(snapshot));
-  }, [snapshot, snapshotForWhatIf]);
+    setWiState(snapshotForWhatIf());
+  }, [snapshotForWhatIf]);
 
   // Jump the head to a recorded decision (marker click / step). Snaps to that
   // decision's exact frame time so the parity-exact recorded path engages.
@@ -395,30 +451,49 @@ function TrackedExplorer({
   // holds. On a snap the recorded path is exact; when paused/scrubbing
   // `liveBucket === clock` so the memo recomputes immediately.
   const playerIds = p.entity_ids_network_order;
-  const result = useMemo(() => {
+  // Compute a FRESH recommendation only when the agent should evaluate this
+  // frame: what-if, a recorded snap, or the ball-handler in the frontcourt. In
+  // the backcourt this returns null and the display carries the last result
+  // (the frontcourt gate, mirroring app.py:422-426 + 725).
+  const agentShouldEval = whatIf || onSnap || bhInFrontcourt;
+  const freshResult = useMemo<QResult | null>(() => {
+    if (!agentShouldEval) return null;
     const shotClock = snapshot.shotClock ?? fallbackShotClock;
-    // What-if (pause-based drag).
+    // What-if (pause-based drag). wiState positions are in the RENDER frame
+    // (raw when full-court) — fold each back to the feature frame the network
+    // reasons in. `toFeature` is identity off the full-court path, so the
+    // half-court fallback is unchanged.
     if (whatIf && wiState) {
+      const bhF = toFeature(wiState.ballHandler.x, wiState.ballHandler.y);
       const wi: WhatIfState = {
-        ...wiState,
-        teammates: wiState.teammates.map((t, i) => ({
-          ...t,
-          zone_fg_pct: (teammateFgLookups[i] ?? (() => 0))(t.x, t.y),
-        })),
+        ballHandler: { x: bhF.x, y: bhF.y, vx: wiState.ballHandler.vx, vy: wiState.ballHandler.vy },
+        teammates: wiState.teammates.map((t, i) => {
+          const f = toFeature(t.x, t.y);
+          return {
+            x: f.x,
+            y: f.y,
+            vx: t.vx,
+            vy: t.vy,
+            zone_fg_pct: (teammateFgLookups[i] ?? (() => 0))(f.x, f.y),
+          };
+        }),
+        defenders: wiState.defenders.map((d) => {
+          const f = toFeature(d.x, d.y);
+          return { x: f.x, y: f.y, vx: d.vx, vy: d.vy };
+        }),
       };
       const state = whatIfToRawState(wi, bhFgLookup);
       state.shot_clock = shotClock;
       const liveQ = runState(net, state, playerIds);
-      if (model === "player") return playerChoice(liveQ.q, p.player_action);
-      return liveQ;
+      return model === "player" ? playerChoice(liveQ.q, p.player_action) : liveQ;
     }
     // Parity-exact recorded path AT a recorded decision snap: stored context
-    // verbatim — reproduces the stored agent_q_values exactly.
+    // verbatim — reproduces the stored agent_q_values exactly. (Decision snaps
+    // are shown regardless of the frontcourt gate — they ARE the lesson.)
     if (onSnap) {
       const state = frameToRawState(p.frames[recordedDecision]);
       const liveQ = runState(net, state, playerIds);
-      if (model === "player") return playerChoice(liveQ.q, p.player_action);
-      return liveQ;
+      return model === "player" ? playerChoice(liveQ.q, p.player_action) : liveQ;
     }
     // Live tracking path (between decisions) — full live recompute on the
     // interpolated tracking snapshot at ~LIVE_HZ (keyed by liveBucket).
@@ -429,15 +504,16 @@ function TrackedExplorer({
       teammateFgLookups,
     );
     const liveQ = runState(net, state, playerIds);
-    if (model === "player") return playerChoice(liveQ.q, p.player_action);
-    return liveQ;
+    return model === "player" ? playerChoice(liveQ.q, p.player_action) : liveQ;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
+    agentShouldEval,
     whatIf,
     wiState,
     onSnap,
     recordedDecision,
     liveBucket,
+    toFeature,
     net,
     model,
     playerIds,
@@ -447,11 +523,25 @@ function TrackedExplorer({
     fallbackShotClock,
   ]);
 
+  // Carry the last fresh recommendation forward across backcourt frames, via the
+  // "adjust state during render" recipe (same as the hysteresis below) — no
+  // effect, no ref read during render. freshResult is a stable memo, so this
+  // converges in one extra render and never loops.
+  const [carried, setCarried] = useState<QResult | null>(null);
+  if (freshResult && freshResult !== carried) setCarried(freshResult);
+
+  // Displayed result: fresh when evaluating, else the carried prior, else
+  // NEUTRAL (best = -1 -> the agent reads as inactive in the UI).
+  const result: QResult = freshResult ?? carried ?? NEUTRAL_RESULT;
+  const agentActive = result.best >= 0;
+
   // --- chip hysteresis (adjust-state-during-render recipe) ---
+  // Only track REAL actions (best >= 0); a NEUTRAL result (backcourt, no carry)
+  // never overwrites the shown action — the UI hides it via `agentActive`.
   const [shownBest, setShownBest] = useState(result.best);
-  if (shownBest !== result.best) {
+  if (shownBest !== result.best && result.best >= 0) {
     const forceSnap =
-      model === "player" || (onSnap && !playing) || whatIf;
+      shownBest < 0 || model === "player" || (onSnap && !playing) || whatIf;
     const beatsByEps =
       result.q[result.best] - (result.q[shownBest] ?? -Infinity) >=
       HYSTERESIS_EPS;
@@ -468,7 +558,7 @@ function TrackedExplorer({
             ...wiState.teammates,
             ...wiState.defenders,
           ]
-        : snapshot.players;
+        : renderPlayers;
     const bh = players[0];
     if (bh) {
       out.push({
@@ -505,30 +595,38 @@ function TrackedExplorer({
       });
     }
     return out;
-  }, [whatIf, wiState, snapshot, p, teammateNames]);
+  }, [whatIf, wiState, renderPlayers, p, teammateNames]);
 
   const ball = useMemo(() => {
     if (whatIf && wiState) {
       return { x: wiState.ballHandler.x, y: wiState.ballHandler.y };
     }
-    return snapshot.ball;
-  }, [whatIf, wiState, snapshot]);
-  const ballZ = whatIf ? 0 : snapshot.ballZ;
+    return rawSnap ? rawSnap.ball : snapshot.ball;
+  }, [whatIf, wiState, rawSnap, snapshot]);
+  const ballZ = whatIf ? 0 : rawSnap ? rawSnap.ballZ : snapshot.ballZ;
 
   const shotClock = snapshot.shotClock;
 
   // --- restrained recommendation cue (tracks the hysteresis-stabilized chip) --
   const arrow: CourtArrow | null = useMemo(() => {
+    if (!agentActive) return null; // no cue until the agent is evaluating
     const rec = shownBest;
     const bh = entities.find((e) => e.id === "bh");
     if (!bh) return null;
     if (rec === 0) {
-      return { fromX: bh.x, fromY: bh.y, toX: BASKET_X, toY: BASKET_Y, kind: "shoot" };
+      // "shoot" cue points at the real attacked basket (raw frame) or the
+      // canonical right basket in the half-court fallback.
+      const basket = fullCourt
+        ? attackingRight
+          ? RAW_BASKET_RIGHT
+          : RAW_BASKET_LEFT
+        : { x: BASKET_X, y: BASKET_Y };
+      return { fromX: bh.x, fromY: bh.y, toX: basket.x, toY: basket.y, kind: "shoot" };
     }
     const target = entities.find((e) => e.id === `tm${rec - 1}`);
     if (!target) return null;
     return { fromX: bh.x, fromY: bh.y, toX: target.x, toY: target.y, kind: "pass" };
-  }, [shownBest, entities]);
+  }, [agentActive, shownBest, entities, fullCourt, attackingRight]);
 
   // --- drag handler: coalesce rapid pointer-moves to one commit per frame ---
   const applyDrag = useCallback(
@@ -575,7 +673,7 @@ function TrackedExplorer({
     };
   }, []);
 
-  const agentLabel = actionLabel(shownBest, teammateNames);
+  const agentLabel = agentActive ? actionLabel(shownBest, teammateNames) : "—";
   const playerLabel = actionLabel(p.player_action, teammateNames);
   const agree = p.agent_action === p.player_action;
 
@@ -630,6 +728,7 @@ function TrackedExplorer({
               onActiveChange={setActiveId}
               onDrag={onDrag}
               showNames={names}
+              fullCourt={fullCourt}
             />
           </div>
 
@@ -791,7 +890,9 @@ function TrackedExplorer({
                 ? "Decision point"
                 : onSnap
                   ? `Decision ${recordedDecision + 1} — recorded`
-                  : "Live — agent tracking the play"}
+                  : agentActive
+                    ? "Live — agent tracking the play"
+                    : "Bringing it up — agent waits for the frontcourt"}
             </span>
             <div className="decision-row">
               <div>
@@ -818,13 +919,22 @@ function TrackedExplorer({
 
           <div className="panel__block">
             <span className="panel__label">Action values (Q)</span>
-            <QBars
-              q={result.q}
-              best={shownBest}
-              labels={labels}
-              playerAction={isDecisionFrame ? p.player_action : undefined}
-            />
-            <p className="agree-note">{modeNote}</p>
+            {agentActive ? (
+              <>
+                <QBars
+                  q={result.q}
+                  best={shownBest}
+                  labels={labels}
+                  playerAction={isDecisionFrame ? p.player_action : undefined}
+                />
+                <p className="agree-note">{modeNote}</p>
+              </>
+            ) : (
+              <p className="live-caption mono">
+                the agent starts evaluating once the offense crosses half-court
+                into its attacking half
+              </p>
+            )}
           </div>
 
           {showOutcome && (

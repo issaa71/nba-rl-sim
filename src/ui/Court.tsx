@@ -1,16 +1,20 @@
-// Raw 2D-canvas half-court renderer + draggable entities.
+// Raw 2D-canvas court renderer + draggable entities.
 //
-// Court frame matches the env: x in [0, 47] (basket at x = 47, RIGHT side),
-// y in [0, 50]. We render the full half-court with the basket on the right and
-// the half-court line on the left, so the offense attacks rightward — the
-// natural reading direction for the arrows.
+// TWO MODES, selected by `fullCourt`:
+//   - HALF-COURT (default): x in [0, 47], single basket on the RIGHT at x = 47.
+//     Used by the stepped fallback view (recorded feature-frame coords).
+//   - FULL-COURT: x in [0, 94], BOTH baskets ((5.25,25) and (88.75,25)) + the
+//     center line at x = 47. Used by the real-time tracking explorer, which
+//     feeds RAW SportVU coordinates so the offense attacks its real basket.
+// y is [0, 50] in both. All geometry is parameterized by the active court length
+// (`courtX`) so a single set of draw helpers serves both modes.
 
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 
 export interface CourtEntity {
   id: string;
   kind: "ball-handler" | "teammate" | "defender";
-  x: number; // env feet, 0..47
+  x: number; // env feet, 0..courtX
   y: number; // env feet, 0..50
   label: string;
   /** teammate slot 1..4 (for arrow targeting); undefined otherwise. */
@@ -46,17 +50,19 @@ interface CourtProps {
   showNames?: boolean;
   /** court opacity 0..1 (kept for transitional fades). */
   fade?: number;
+  /** render the FULL 94ft court (both baskets) instead of a half-court. */
+  fullCourt?: boolean;
 }
 
 // Court geometry in env feet.
-const COURT_X = 47; // length from half-court line (x=0) to baseline (x=47)
+const COURT_X_HALF = 47; // half-court line (x=0) to baseline (x=47)
+const COURT_X_FULL = 94; // baseline-to-baseline
 const COURT_Y = 50; // width
 const PAD = 28; // px padding around the court inside the canvas
-const ASPECT = COURT_Y / COURT_X; // height / width of the play area
 
-// Logical canvas size (CSS pixels); device pixel ratio applied on top.
-const CANVAS_W = 560;
-const CANVAS_H = Math.round((CANVAS_W - PAD * 2) * ASPECT) + PAD * 2;
+// Logical canvas width (CSS px); full court is wider so players stay legible.
+const CANVAS_W_HALF = 560;
+const CANVAS_W_FULL = 760;
 
 const COL = {
   teammate: "#047857",
@@ -65,32 +71,125 @@ const COL = {
   arrow: "#047857",
 };
 
-// env (x,y) -> canvas px. Basket on the RIGHT (x=47 -> right edge).
-function toPx(x: number, y: number, w: number, h: number) {
+// env (x,y) -> canvas px, for a court `courtX` feet long.
+function toPx(x: number, y: number, w: number, h: number, courtX: number) {
   const playW = w - PAD * 2;
   const playH = h - PAD * 2;
-  const px = PAD + (x / COURT_X) * playW;
+  const px = PAD + (x / courtX) * playW;
   const py = PAD + (y / COURT_Y) * playH;
   return { px, py };
 }
 
 // canvas px -> env (x,y).
-function toEnv(px: number, py: number, w: number, h: number) {
+function toEnv(px: number, py: number, w: number, h: number, courtX: number) {
   const playW = w - PAD * 2;
   const playH = h - PAD * 2;
-  let x = ((px - PAD) / playW) * COURT_X;
+  let x = ((px - PAD) / playW) * courtX;
   let y = ((py - PAD) / playH) * COURT_Y;
-  x = Math.max(0, Math.min(COURT_X, x));
+  x = Math.max(0, Math.min(courtX, x));
   y = Math.max(0, Math.min(COURT_Y, y));
   return { x, y };
 }
 
-function drawCourt(ctx: CanvasRenderingContext2D, w: number, h: number) {
+/** ft -> px scale on the x axis (used for radii). */
+function ftPxX(ft: number, w: number, courtX: number) {
+  return Math.abs(toPx(0, 0, w, 0, courtX).px - toPx(ft, 0, w, 0, courtX).px);
+}
+function ftPxY(ft: number, h: number) {
+  return Math.abs(toPx(0, 0, 0, h, 1).py - toPx(0, ft, 0, h, 1).py);
+}
+
+/**
+ * Draw one scoring end: backboard, rim, painted key, free-throw circle,
+ * restricted arc, and 3pt arc. `baselineX` is the end line (0 or courtX);
+ * `basketX` is the rim x. The key + arcs open toward center court.
+ */
+function drawBasketEnd(
+  ctx: CanvasRenderingContext2D,
+  baselineX: number,
+  basketX: number,
+  w: number,
+  h: number,
+  courtX: number,
+) {
+  const inward = baselineX < basketX ? 1 : -1; // toward center court
+  const basket = toPx(basketX, 25, w, h, courtX);
+
+  // backboard (4 ft in from the baseline) + rim
+  const bbX = toPx(baselineX + inward * 4, 25, w, h, courtX).px;
+  ctx.beginPath();
+  ctx.moveTo(bbX, toPx(0, 22, w, h, courtX).py);
+  ctx.lineTo(bbX, toPx(0, 28, w, h, courtX).py);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(basket.px + inward * 1, basket.py, 5, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // painted key: baseline back ~19 ft, 16 ft wide (y 17..33)
+  const keyBaseX = toPx(baselineX, 25, w, h, courtX).px;
+  const keyTopX = toPx(baselineX + inward * 19, 25, w, h, courtX).px;
+  const keyY1 = toPx(0, 17, w, h, courtX).py;
+  const keyY2 = toPx(0, 33, w, h, courtX).py;
+  ctx.strokeRect(
+    Math.min(keyTopX, keyBaseX),
+    Math.min(keyY1, keyY2),
+    Math.abs(keyBaseX - keyTopX),
+    Math.abs(keyY2 - keyY1),
+  );
+
+  // free-throw circle (6 ft radius at the FT line), facing center
+  ctx.beginPath();
+  ctx.arc(
+    keyTopX,
+    basket.py,
+    ftPxY(6, h),
+    inward > 0 ? -Math.PI / 2 : Math.PI / 2,
+    inward > 0 ? Math.PI / 2 : (3 * Math.PI) / 2,
+  );
+  ctx.stroke();
+
+  // restricted-area arc near the rim (4 ft), facing center
+  ctx.beginPath();
+  ctx.arc(
+    basket.px + inward * 1,
+    basket.py,
+    ftPxX(4, w, courtX),
+    inward > 0 ? -Math.PI / 2 : Math.PI / 2,
+    inward > 0 ? Math.PI / 2 : (3 * Math.PI) / 2,
+  );
+  ctx.stroke();
+
+  // three-point arc: ~22 ft radius from the basket, opening toward center
+  const r3 = 22;
+  const rPxX = ftPxX(r3, w, courtX);
+  const rPxY = ftPxY(r3, h);
+  ctx.save();
+  ctx.translate(basket.px, basket.py);
+  ctx.scale(1, rPxY / rPxX);
+  ctx.beginPath();
+  ctx.arc(
+    0,
+    0,
+    rPxX,
+    inward > 0 ? -Math.PI / 2 : Math.PI / 2,
+    inward > 0 ? Math.PI / 2 : (3 * Math.PI) / 2,
+  );
+  ctx.restore();
+  ctx.stroke();
+}
+
+function drawCourt(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  courtX: number,
+  fullCourt: boolean,
+) {
   ctx.clearRect(0, 0, w, h);
 
-  // play area
-  const tl = toPx(0, 0, w, h);
-  const br = toPx(COURT_X, COURT_Y, w, h);
+  const tl = toPx(0, 0, w, h, courtX);
+  const br = toPx(courtX, COURT_Y, w, h, courtX);
   const px = tl.px;
   const py = tl.py;
   const pw = br.px - tl.px;
@@ -102,94 +201,64 @@ function drawCourt(ctx: CanvasRenderingContext2D, w: number, h: number) {
 
   ctx.lineWidth = 1.5;
   ctx.strokeStyle = "#c8b896";
+  ctx.strokeRect(px, py, pw, ph); // outer boundary
 
-  // outer boundary
-  ctx.strokeRect(px, py, pw, ph);
-
-  const basket = toPx(47, 25, w, h);
-
-  // backboard + rim (right side)
-  ctx.beginPath();
-  const bbX = toPx(43, 25, w, h).px;
-  ctx.moveTo(bbX + (basket.px - bbX) * 0.92, toPx(47, 22, w, h).py);
-  ctx.lineTo(bbX + (basket.px - bbX) * 0.92, toPx(47, 28, w, h).py);
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.arc(basket.px - 6, basket.py, 5, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // paint / key (from baseline x=47 back ~19ft, 16ft wide centered on y=25)
-  const keyBaseX = toPx(47, 25, w, h).px;
-  const keyTopX = toPx(28, 25, w, h).px;
-  const keyY1 = toPx(47, 17, w, h).py;
-  const keyY2 = toPx(47, 33, w, h).py;
-  ctx.strokeRect(
-    Math.min(keyTopX, keyBaseX),
-    Math.min(keyY1, keyY2),
-    Math.abs(keyBaseX - keyTopX),
-    Math.abs(keyY2 - keyY1),
-  );
-
-  // free-throw circle
-  ctx.beginPath();
-  ctx.arc(keyTopX, basket.py, Math.abs(toPx(0, 0, w, h).py - toPx(0, 6, w, h).py), -Math.PI / 2, Math.PI / 2);
-  ctx.stroke();
-
-  // restricted-area arc near rim
-  ctx.beginPath();
-  ctx.arc(basket.px - 6, basket.py, Math.abs(toPx(0, 0, w, h).px - toPx(4, 0, w, h).px), Math.PI / 2, (3 * Math.PI) / 2);
-  ctx.stroke();
-
-  // three-point arc: 22 ft radius from basket, plus corner straights
-  ctx.beginPath();
-  const r3 = 22;
-  const rPxX = Math.abs(toPx(0, 0, w, h).px - toPx(r3, 0, w, h).px);
-  const rPxY = Math.abs(toPx(0, 0, w, h).py - toPx(0, r3, w, h).py);
-  ctx.save();
-  ctx.translate(basket.px, basket.py);
-  ctx.scale(1, rPxY / rPxX);
-  ctx.beginPath();
-  ctx.arc(0, 0, rPxX, Math.PI / 2, (3 * Math.PI) / 2);
-  ctx.restore();
-  ctx.stroke();
-
-  // half-court line (left edge x=0) accent
-  ctx.strokeStyle = "#d3c4a3";
-  ctx.beginPath();
-  ctx.moveTo(px, py);
-  ctx.lineTo(px, py + ph);
-  ctx.stroke();
+  if (fullCourt) {
+    // both scoring ends
+    drawBasketEnd(ctx, 0, 5.25, w, h, courtX);
+    drawBasketEnd(ctx, courtX, courtX - 5.25, w, h, courtX);
+    // center line + center circle
+    const cl = toPx(courtX / 2, 0, w, h, courtX).px;
+    ctx.strokeStyle = "#d3c4a3";
+    ctx.beginPath();
+    ctx.moveTo(cl, py);
+    ctx.lineTo(cl, py + ph);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(toPx(courtX / 2, 25, w, h, courtX).px, toPx(0, 25, w, h, courtX).py, ftPxY(6, h), 0, Math.PI * 2);
+    ctx.stroke();
+  } else {
+    // single right-hand basket + the half-court accent line on the left edge
+    drawBasketEnd(ctx, courtX, courtX - 5.25, w, h, courtX);
+    // (the half-court line is the left boundary, already stroked)
+    ctx.strokeStyle = "#d3c4a3";
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    ctx.lineTo(px, py + ph);
+    ctx.stroke();
+  }
 }
 
 /**
- * Restrained recommendation cue. Replaces the old full-length straight arrow
- * (which read as an absurd diagram line). Two restrained forms:
- *
- *   PASS  — a soft, low-opacity QUADRATIC curve bowing from the ball-handler
+ * Restrained recommendation cue. Two restrained forms:
+ *   PASS  — a soft, low-opacity quadratic curve bowing from the ball-handler
  *           toward the target teammate, stopping short of the dot, plus a small
  *           accent ring + connecting tick on the target. No big arrowhead.
- *   SHOOT — no long line; just a short tick off the ball-handler toward the
- *           basket and a soft accent ring on the rim, so the call reads subtly.
- *
- * Everything is scaled down and translucent so it informs without dominating.
+ *   SHOOT — no long line; a short tick off the ball-handler toward the basket
+ *           and a soft accent ring on the rim, so the call reads subtly.
  */
-function drawArrow(ctx: CanvasRenderingContext2D, a: CourtArrow, w: number, h: number) {
-  const from = toPx(a.fromX, a.fromY, w, h);
-  const to = toPx(a.toX, a.toY, w, h);
+function drawArrow(
+  ctx: CanvasRenderingContext2D,
+  a: CourtArrow,
+  w: number,
+  h: number,
+  courtX: number,
+) {
+  const from = toPx(a.fromX, a.fromY, w, h, courtX);
+  const to = toPx(a.toX, a.toY, w, h, courtX);
   const dx = to.px - from.px;
   const dy = to.py - from.py;
   const len = Math.hypot(dx, dy) || 1;
   const ux = dx / len;
   const uy = dy / len;
+  // point the rim ring/ticks at the basket regardless of which side it's on
+  const rimDir = a.toX >= a.fromX ? 1 : -1;
 
   ctx.save();
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
 
   if (a.kind === "shoot") {
-    // Subtle "shoot" cue: a short tick off the BH toward the rim + a soft ring
-    // on the basket. No long line crossing the court.
     const tick = Math.min(22, len * 0.5);
     const sx = from.px + ux * 15;
     const sy = from.py + uy * 15;
@@ -201,25 +270,22 @@ function drawArrow(ctx: CanvasRenderingContext2D, a: CourtArrow, w: number, h: n
     ctx.lineTo(sx + ux * tick, sy + uy * tick);
     ctx.stroke();
     ctx.setLineDash([]);
-    // soft accent ring on the rim
     ctx.strokeStyle = "rgba(4,120,87,0.55)";
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(to.px - 6, to.py, 11, 0, Math.PI * 2);
+    ctx.arc(to.px - rimDir * 6, to.py, 11, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
     return;
   }
 
-  // PASS cue: a soft quadratic curve bowing toward the target, stopping short
-  // of the target dot; a connecting tick + accent ring sits on the teammate.
+  // PASS cue
   const startGap = 15;
   const endGap = 18;
   const sx = from.px + ux * startGap;
   const sy = from.py + uy * startGap;
   const ex = to.px - ux * endGap;
   const ey = to.py - uy * endGap;
-  // Perpendicular bow, proportional to length (gentle, capped).
   const bow = Math.min(26, len * 0.16);
   const mx = (sx + ex) / 2 - uy * bow;
   const my = (sy + ey) / 2 + ux * bow;
@@ -231,7 +297,6 @@ function drawArrow(ctx: CanvasRenderingContext2D, a: CourtArrow, w: number, h: n
   ctx.quadraticCurveTo(mx, my, ex, ey);
   ctx.stroke();
 
-  // accent ring on the target teammate
   ctx.strokeStyle = "rgba(4,120,87,0.6)";
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -247,11 +312,6 @@ function compactName(label: string): string {
   return parts.length > 1 ? parts[parts.length - 1] : label;
 }
 
-/**
- * Always-on label beneath a dot. Drawn with a paper-colored halo (stroke under
- * fill) so it stays legible over court lines and dots. `tone` controls contrast:
- * offense reads in warm ink, defenders sit fainter.
- */
 function drawNameLabel(
   ctx: CanvasRenderingContext2D,
   text: string,
@@ -266,7 +326,6 @@ function drawNameLabel(
   ctx.textAlign = "center";
   ctx.textBaseline = "top";
   const ty = py + r + 3;
-  // paper halo for contrast on the wood + lines
   ctx.lineJoin = "round";
   ctx.lineWidth = 3;
   ctx.strokeStyle = "rgba(244,239,230,0.92)";
@@ -285,8 +344,8 @@ function drawEntities(
   showNames: boolean,
   w: number,
   h: number,
+  courtX: number,
 ) {
-  // defenders first (under offense)
   const order = [...entities].sort((a, b) => {
     const rank = (k: CourtEntity["kind"]) =>
       k === "defender" ? 0 : k === "teammate" ? 1 : 2;
@@ -294,7 +353,7 @@ function drawEntities(
   });
 
   for (const e of order) {
-    const { px, py } = toPx(e.x, e.y, w, h);
+    const { px, py } = toPx(e.x, e.y, w, h, courtX);
     const active = e.id === activeId;
     const r = e.kind === "ball-handler" ? 11 : 9.5;
 
@@ -312,7 +371,6 @@ function drawEntities(
     }
 
     if (e.kind === "ball-handler") {
-      // emphasis ring
       ctx.beginPath();
       ctx.arc(px, py, r + 4.5, 0, Math.PI * 2);
       ctx.lineWidth = 2;
@@ -320,10 +378,6 @@ function drawEntities(
       ctx.stroke();
     }
 
-    // Always-on compact name labels. Offense (BH + teammates) is labeled by
-    // last name in ink; defenders are unnamed in the data, so they only get a
-    // label on hover (the pill below). The active entity shows the full-name
-    // pill instead of the compact label to avoid double-drawing.
     if (showNames && !active && e.kind !== "defender") {
       drawNameLabel(ctx, compactName(e.label), px, py, r, "offense");
     }
@@ -335,7 +389,6 @@ function drawEntities(
       ctx.strokeStyle = "rgba(4,120,87,0.5)";
       ctx.stroke();
 
-      // name label
       const text = e.label;
       ctx.font = "600 12px 'Geist', system-ui, sans-serif";
       const tw = ctx.measureText(text).width;
@@ -351,22 +404,16 @@ function drawEntities(
     }
   }
 
-  // ball — the REAL tracked ball. At rest (low z) it sits as a small accented
-  // dot just off the handler. As the ball rises (a shot or a lob pass) we lift
-  // it visually: a soft shadow stays on the floor and the ball floats up with a
-  // faint trailing arc, so the shot reads without a literal parabola overlay.
-  const bp = toPx(ball.x, ball.y, w, h);
-  const REST_Z = 4; // ~dribble/hold height (ft); above this reads as "in flight"
-  const lift = ballZ > REST_Z ? Math.min(1, (ballZ - REST_Z) / 7) : 0; // 0..1
+  // ball — the REAL tracked ball, with a height-driven lift for shots/lobs.
+  const bp = toPx(ball.x, ball.y, w, h, courtX);
+  const REST_Z = 4;
+  const lift = ballZ > REST_Z ? Math.min(1, (ballZ - REST_Z) / 7) : 0;
   if (lift > 0) {
-    // floor shadow (where the ball is, on the wood)
     ctx.beginPath();
     ctx.ellipse(bp.px, bp.py, 5 - lift * 1.5, 2.6 - lift, 0, 0, Math.PI * 2);
     ctx.fillStyle = "rgba(40,32,20,0.18)";
     ctx.fill();
-    // raised ball: lift it upward (toward top of canvas) proportional to height
     const ry = bp.py - lift * 26;
-    // faint trailing arc from the floor up to the ball
     ctx.beginPath();
     ctx.moveTo(bp.px, bp.py);
     ctx.quadraticCurveTo(bp.px - 4, (bp.py + ry) / 2, bp.px, ry);
@@ -419,9 +466,18 @@ export function Court({
   onDrag,
   showNames = true,
   fade = 1,
+  fullCourt = false,
 }: CourtProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const draggingRef = useRef<string | null>(null);
+
+  // Active court dimensions (depend on mode).
+  const courtX = fullCourt ? COURT_X_FULL : COURT_X_HALF;
+  const { canvasW, canvasH } = useMemo(() => {
+    const cw = fullCourt ? CANVAS_W_FULL : CANVAS_W_HALF;
+    const ch = Math.round((cw - PAD * 2) * (COURT_Y / courtX)) + PAD * 2;
+    return { canvasW: cw, canvasH: ch };
+  }, [fullCourt, courtX]);
 
   // redraw whenever inputs change
   useEffect(() => {
@@ -430,35 +486,36 @@ export function Court({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    if (canvas.width !== CANVAS_W * dpr) {
-      canvas.width = CANVAS_W * dpr;
-      canvas.height = CANVAS_H * dpr;
+    if (canvas.width !== canvasW * dpr || canvas.height !== canvasH * dpr) {
+      canvas.width = canvasW * dpr;
+      canvas.height = canvasH * dpr;
     }
     ctx.save();
     ctx.scale(dpr, dpr);
-    drawCourt(ctx, CANVAS_W, CANVAS_H);
-    // Optional transitional fade over the play layer; the wood backdrop stays.
+    drawCourt(ctx, canvasW, canvasH, courtX, fullCourt);
     ctx.globalAlpha = Math.max(0, Math.min(1, fade));
-    if (arrow) drawArrow(ctx, arrow, CANVAS_W, CANVAS_H);
-    drawEntities(ctx, entities, ball, ballZ, activeId, showNames, CANVAS_W, CANVAS_H);
+    if (arrow) drawArrow(ctx, arrow, canvasW, canvasH, courtX);
+    drawEntities(ctx, entities, ball, ballZ, activeId, showNames, canvasW, canvasH, courtX);
     ctx.restore();
-  }, [entities, ball, ballZ, arrow, activeId, showNames, fade]);
+  }, [entities, ball, ballZ, arrow, activeId, showNames, fade, canvasW, canvasH, courtX, fullCourt]);
 
-  const eventToCanvas = useCallback((clientX: number, clientY: number) => {
-    const canvas = canvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    const sx = CANVAS_W / rect.width;
-    const sy = CANVAS_H / rect.height;
-    return { cx: (clientX - rect.left) * sx, cy: (clientY - rect.top) * sy };
-  }, []);
+  const eventToCanvas = useCallback(
+    (clientX: number, clientY: number) => {
+      const canvas = canvasRef.current!;
+      const rect = canvas.getBoundingClientRect();
+      const sx = canvasW / rect.width;
+      const sy = canvasH / rect.height;
+      return { cx: (clientX - rect.left) * sx, cy: (clientY - rect.top) * sy };
+    },
+    [canvasW, canvasH],
+  );
 
   const hitTest = useCallback(
     (cx: number, cy: number): CourtEntity | null => {
-      // topmost (offense over defense) wins; iterate reverse draw order
       let best: CourtEntity | null = null;
       let bestD = Infinity;
       for (const e of entities) {
-        const { px, py } = toPx(e.x, e.y, CANVAS_W, CANVAS_H);
+        const { px, py } = toPx(e.x, e.y, canvasW, canvasH, courtX);
         const d = Math.hypot(px - cx, py - cy);
         const r = (e.kind === "ball-handler" ? 11 : 9.5) + 6;
         if (d <= r && d < bestD) {
@@ -468,7 +525,7 @@ export function Court({
       }
       return best;
     },
-    [entities],
+    [entities, canvasW, canvasH, courtX],
   );
 
   const onPointerDown = useCallback(
@@ -492,18 +549,17 @@ export function Court({
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       if (draggingRef.current && draggable && onDrag) {
         const { cx, cy } = eventToCanvas(e.clientX, e.clientY);
-        const { x, y } = toEnv(cx, cy, CANVAS_W, CANVAS_H);
+        const { x, y } = toEnv(cx, cy, canvasW, canvasH, courtX);
         onDrag(draggingRef.current, x, y);
         return;
       }
-      // hover highlight (desktop only — pointer move without button)
       if (e.pointerType === "mouse" && e.buttons === 0) {
         const { cx, cy } = eventToCanvas(e.clientX, e.clientY);
         const hit = hitTest(cx, cy);
         onActiveChange(hit ? hit.id : null);
       }
     },
-    [draggable, eventToCanvas, hitTest, onActiveChange, onDrag],
+    [draggable, eventToCanvas, hitTest, onActiveChange, onDrag, canvasW, canvasH, courtX],
   );
 
   const endDrag = useCallback((e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -522,11 +578,15 @@ export function Court({
       ref={canvasRef}
       className="court-canvas"
       style={{
-        aspectRatio: `${CANVAS_W} / ${CANVAS_H}`,
+        aspectRatio: `${canvasW} / ${canvasH}`,
         cursor: draggable ? "grab" : "default",
       }}
       role="img"
-      aria-label="Half-court possession diagram. Offense in emerald, defenders in gray, ball-handler ringed."
+      aria-label={
+        fullCourt
+          ? "Full-court possession diagram. Offense in emerald, defenders in gray, ball-handler ringed; both baskets shown."
+          : "Half-court possession diagram. Offense in emerald, defenders in gray, ball-handler ringed."
+      }
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={endDrag}

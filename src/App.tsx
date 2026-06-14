@@ -155,6 +155,7 @@ export default function App() {
             key={selected.id}
             possession={selected}
             tracking={data.tracking.get(selected.id) ?? null}
+            trackingFc={data.trackingFc.get(selected.id) ?? null}
             data={data}
             model={model}
             onModelChange={setModel}
